@@ -35,7 +35,7 @@ from op_core.exceptions import (
     OpNotFoundError,
     OpTimeoutError,
 )
-from op_core.items import Item, ItemSummary
+from op_core.items import Item, ItemSummary, VaultSummary
 
 # ---------- minimal SDK-shaped fakes (Tier A) ----------
 
@@ -348,6 +348,40 @@ class TestAsyncSDKBackendListItems:
         assert [s.id for s in out] == ["i1"]
 
 
+class TestAsyncSDKBackendListVaults:
+    async def test_empty_account(self):
+        fc = FakeClient()
+        backend = AsyncSDKBackend(_auth(), client=fc)
+        assert await backend.list_vaults() == []
+        assert fc.vaults.list_calls == 1
+
+    async def test_parses_vaults(self):
+        fc = FakeClient()
+        fc.vaults.vaults = [
+            FakeVaultOverview(id="v1", title="Personal"),
+            FakeVaultOverview(id="v2", title="Shared"),
+        ]
+        backend = AsyncSDKBackend(_auth(), client=fc)
+        result = await backend.list_vaults()
+        assert result == [
+            VaultSummary(id="v1", name="Personal"),
+            VaultSummary(id="v2", name="Shared"),
+        ]
+
+    async def test_maps_sdk_errors(self):
+        fc = FakeClient()
+
+        # The FakeVaults stub doesn't expose a raise_on hook the way FakeItems does;
+        # patch directly to simulate an SDK exception with auth-shaped text.
+        async def boom() -> list[FakeVaultOverview]:
+            raise Exception("invalid token")
+
+        fc.vaults.list = boom  # type: ignore[method-assign]
+        backend = AsyncSDKBackend(_auth(), client=fc)
+        with pytest.raises(OpAuthError):
+            await backend.list_vaults()
+
+
 class TestAsyncSDKBackendGetItem:
     def _populated(self) -> FakeClient:
         fc = FakeClient()
@@ -400,6 +434,7 @@ class RecordingAsync:
     def __init__(self) -> None:
         self.read_calls: list[tuple[str, str | None]] = []
         self.list_calls: list[tuple[str | None, Any, Any]] = []
+        self.list_vaults_calls = 0
         self.get_calls: list[tuple[Any, str | None]] = []
 
     async def read(self, reference: str, *, default_value: str | None = None, online: bool = True) -> str:
@@ -408,6 +443,10 @@ class RecordingAsync:
 
     async def list_items(self, *, vault=None, tags=None, categories=None):
         self.list_calls.append((vault, tags, categories))
+        return []
+
+    async def list_vaults(self):
+        self.list_vaults_calls += 1
         return []
 
     async def get_item(self, item, *, vault=None):
@@ -422,6 +461,7 @@ class RecordingAsync:
             sections=(),
             fields=(),
         )
+
 
 class TestSDKBackendSync:
     def test_rejects_desktop_auth(self):
@@ -456,6 +496,13 @@ class TestSDKBackendSync:
         backend._async = recorder  # type: ignore[assignment]
         backend.get_item("i1", vault="v1")
         assert recorder.get_calls == [("i1", "v1")]
+
+    def test_list_vaults_drives_async(self):
+        backend = SDKBackend(_auth())
+        recorder = RecordingAsync()
+        backend._async = recorder  # type: ignore[assignment]
+        assert backend.list_vaults() == []
+        assert recorder.list_vaults_calls == 1
 
     def test_background_loop_actually_runs(self):
         backend = SDKBackend(_auth())

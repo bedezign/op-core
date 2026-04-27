@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
+from typing import cast
 
 from op_core.opref import OPS_PREFIX, OpRef
 
@@ -184,7 +185,7 @@ class FieldValue:
 
     def with_resolved(self, resolved: str | None) -> FieldValue:
         """Return a copy with ``resolved`` replaced."""
-        return replace(self, resolved=resolved)
+        return cast(FieldValue, replace(self, resolved=resolved))
 
     def to_dict(self) -> dict[str, str | bool | None]:
         """Serialize to a JSON-friendly dict.

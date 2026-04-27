@@ -35,7 +35,7 @@ from op_core.field import (
     is_sensitive,
     normalize_original,
 )
-from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary
+from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
 from op_core.opref import OpRef
 from op_core.strings import expand_braces
 
@@ -72,6 +72,7 @@ __all__ = (  # noqa: RUF022 — semantic grouping intentional
     "ItemSection",
     "ItemSummary",
     "ItemRef",
+    "VaultSummary",
     # Field / reference models
     "FieldValue",
     "OpRef",

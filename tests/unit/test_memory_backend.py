@@ -6,7 +6,7 @@ import pytest
 
 from op_core.backends.memory import AsyncInMemoryBackend, InMemoryBackend
 from op_core.exceptions import OpNotFoundError, OpOfflineError
-from op_core.items import Item, ItemField, ItemSection, ItemSummary
+from op_core.items import Item, ItemField, ItemSection, ItemSummary, VaultSummary
 
 
 def _make_item(
@@ -223,6 +223,58 @@ class TestGetItem:
             self._backend().get_item("b", vault="v2")
 
 
+# ---------- list_vaults ----------
+
+
+class TestListVaults:
+    def test_empty_returns_empty(self):
+        backend = InMemoryBackend()
+        assert backend.list_vaults() == []
+
+    def test_single_vault_from_items(self):
+        items = [_make_item(item_id="a"), _make_item(item_id="b")]
+        backend = InMemoryBackend(items=items)
+        result = backend.list_vaults()
+        assert result == [VaultSummary(id="v1", name="Personal")]
+
+    def test_distinct_vaults_deduped(self):
+        items = [
+            _make_item(item_id="a", vault_id="v1", vault_name="Personal"),
+            _make_item(item_id="b", vault_id="v2", vault_name="Shared"),
+            _make_item(item_id="c", vault_id="v1", vault_name="Personal"),
+        ]
+        backend = InMemoryBackend(items=items)
+        result = backend.list_vaults()
+        assert result == [
+            VaultSummary(id="v1", name="Personal"),
+            VaultSummary(id="v2", name="Shared"),
+        ]
+
+    def test_preserves_first_seen_order(self):
+        items = [
+            _make_item(item_id="a", vault_id="v2", vault_name="Shared"),
+            _make_item(item_id="b", vault_id="v1", vault_name="Personal"),
+            _make_item(item_id="c", vault_id="v3", vault_name="Work"),
+        ]
+        backend = InMemoryBackend(items=items)
+        assert [v.id for v in backend.list_vaults()] == ["v2", "v1", "v3"]
+
+    def test_first_seen_name_wins_on_collision(self):
+        # Two items share vault_id but disagree on vault_name — first-seen wins
+        # silently. In practice items from the same vault carry the same name;
+        # this guards the dedup contract rather than a real-world scenario.
+        items = [
+            _make_item(item_id="a", vault_id="v1", vault_name="Personal"),
+            _make_item(item_id="b", vault_id="v1", vault_name="Personal Renamed"),
+        ]
+        backend = InMemoryBackend(items=items)
+        assert backend.list_vaults() == [VaultSummary(id="v1", name="Personal")]
+
+    def test_returns_vault_summary_instances(self):
+        backend = InMemoryBackend(items=[_make_item()])
+        assert all(isinstance(v, VaultSummary) for v in backend.list_vaults())
+
+
 # ---------- async wrapper ----------
 
 
@@ -248,6 +300,22 @@ class TestAsyncInMemoryBackend:
     async def test_list_items_validation(self):
         with pytest.raises(ValueError, match="tags"):
             await AsyncInMemoryBackend().list_items(tags=[])
+
+    async def test_list_vaults_empty(self):
+        assert await AsyncInMemoryBackend().list_vaults() == []
+
+    async def test_list_vaults_dedupes(self):
+        items = [
+            _make_item(item_id="a", vault_id="v1", vault_name="Personal"),
+            _make_item(item_id="b", vault_id="v2", vault_name="Shared"),
+            _make_item(item_id="c", vault_id="v1", vault_name="Personal"),
+        ]
+        backend = AsyncInMemoryBackend(items=items)
+        result = await backend.list_vaults()
+        assert result == [
+            VaultSummary(id="v1", name="Personal"),
+            VaultSummary(id="v2", name="Shared"),
+        ]
 
 
 # ---------- item auto-indexing ----------
@@ -469,6 +537,9 @@ class _RecordingBackend:
     def list_items(self, **kwargs):
         return []
 
+    def list_vaults(self):
+        return []
+
     def get_item(self, item, *, vault=None):
         raise OpNotFoundError(item)
 
@@ -539,6 +610,9 @@ class TestAsyncFallback:
             raise OpNotFoundError(reference)
 
         async def list_items(self, **kwargs):
+            return []
+
+        async def list_vaults(self):
             return []
 
         async def get_item(self, item, *, vault=None):

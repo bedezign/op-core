@@ -6,7 +6,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary
+from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
 
 
 class TestItemSection:
@@ -229,6 +229,27 @@ class TestItemSummary:
         """An ItemSummary is not an Item — callers can type-distinguish the two."""
         s = self._make()
         assert not isinstance(s, Item)
+
+
+class TestVaultSummary:
+    def _make(self) -> VaultSummary:
+        return VaultSummary(id="vqxm5hdjdy3f7hfgbk5p3ybrqe", name="Personal")
+
+    def test_construction(self):
+        v = self._make()
+        assert v.id == "vqxm5hdjdy3f7hfgbk5p3ybrqe"
+        assert v.name == "Personal"
+
+    def test_frozen(self):
+        v = self._make()
+        with pytest.raises(FrozenInstanceError):
+            v.name = "changed"  # type: ignore[misc]
+
+    def test_equality(self):
+        assert self._make() == self._make()
+
+    def test_hashable(self):
+        assert hash(self._make()) == hash(self._make())
 
 
 class TestItemRef:

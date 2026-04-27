@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
-from op_core.items import Item, ItemRef, ItemSummary
+from op_core.items import Item, ItemRef, ItemSummary, VaultSummary
 
 
 @runtime_checkable
@@ -33,6 +33,8 @@ class Backend(Protocol):
         tags: Sequence[str] | None = None,
         categories: Sequence[str] | None = None,
     ) -> list[ItemSummary]: ...
+
+    def list_vaults(self) -> list[VaultSummary]: ...
 
     def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item: ...
 
@@ -54,5 +56,7 @@ class AsyncBackend(Protocol):
         tags: Sequence[str] | None = None,
         categories: Sequence[str] | None = None,
     ) -> list[ItemSummary]: ...
+
+    async def list_vaults(self) -> list[VaultSummary]: ...
 
     async def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item: ...

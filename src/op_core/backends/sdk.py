@@ -49,7 +49,7 @@ from op_core.exceptions import (
     OpOfflineError,
     OpTimeoutError,
 )
-from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary
+from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
@@ -228,7 +228,7 @@ class AsyncSDKBackend:
         online: bool = True,
     ) -> str:
         if not online:
-            raise OpOfflineError(f'AsyncSDKBackend cannot satisfy {reference} offline')
+            raise OpOfflineError(f"AsyncSDKBackend cannot satisfy {reference} offline")
         client = await self._get_client()
         try:
             return await client.secrets.resolve(reference)
@@ -290,6 +290,17 @@ class AsyncSDKBackend:
             raise _map_sdk_error(exc) from exc
         return _sdk_item_to_canonical(raw)
 
+    async def list_vaults(self) -> list[VaultSummary]:
+        # The SDK's VaultOverview exposes `id` and `title`; op-core's
+        # canonical shape names the human label `name` (matching CLIBackend
+        # and `op vault list --format json`), so we map title -> name here.
+        client = await self._get_client()
+        try:
+            overviews = await client.vaults.list()
+        except Exception as exc:
+            raise _map_sdk_error(exc) from exc
+        return [VaultSummary(id=v.id, name=v.title or "") for v in overviews]
+
 
 class SDKBackend:
     """Sync facade that drives an :class:`AsyncSDKBackend` on a background loop.
@@ -339,7 +350,7 @@ class SDKBackend:
         online: bool = True,
     ) -> str:
         if not online:
-            raise OpOfflineError(f'SDKBackend cannot satisfy {reference} offline')
+            raise OpOfflineError(f"SDKBackend cannot satisfy {reference} offline")
         return self._run(self._async.read(reference, default_value=default_value, online=online))
 
     def list_items(
@@ -353,3 +364,6 @@ class SDKBackend:
 
     def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
         return self._run(self._async.get_item(item, vault=vault))
+
+    def list_vaults(self) -> list[VaultSummary]:
+        return self._run(self._async.list_vaults())

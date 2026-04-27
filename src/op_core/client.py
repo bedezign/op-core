@@ -17,7 +17,7 @@ from op_core.backends.base import AsyncBackend, Backend
 from op_core.backends.detect import detect_async_backend, detect_backend
 from op_core.exceptions import OpNotFoundError
 from op_core.field import FieldValue, async_resolve_chain, resolve_chain
-from op_core.items import Item, ItemRef, ItemSummary
+from op_core.items import Item, ItemRef, ItemSummary, VaultSummary
 from op_core.opref import OpRef
 
 
@@ -119,6 +119,24 @@ class OnePassword:
         """
         return self._backend.get_item(item, vault=vault)
 
+    def list_vaults(self) -> list[VaultSummary]:
+        """Enumerate the vaults available to the configured backend.
+
+        Returns lightweight :class:`VaultSummary` instances (id + name).
+        Useful for scoping subsequent ``list_items`` calls per-vault on
+        large accounts where an unscoped enumeration would be slow.
+
+        >>> from op_core import InMemoryBackend, Item, OnePassword
+        >>> a = Item(id='i1', title='T', vault_id='v1', vault_name='Personal',
+        ...          category='LOGIN', tags=(), sections=(), fields=())
+        >>> b = Item(id='i2', title='T', vault_id='v2', vault_name='Shared',
+        ...          category='LOGIN', tags=(), sections=(), fields=())
+        >>> op = OnePassword(InMemoryBackend(items=[a, b]))
+        >>> [(v.id, v.name) for v in op.list_vaults()]
+        [('v1', 'Personal'), ('v2', 'Shared')]
+        """
+        return self._backend.list_vaults()
+
 
 class AsyncOnePassword:
     """Async 1Password client facade. Mirrors :class:`OnePassword`."""
@@ -155,3 +173,16 @@ class AsyncOnePassword:
 
     async def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
         return await self._backend.get_item(item, vault=vault)
+
+    async def list_vaults(self) -> list[VaultSummary]:
+        """Async mirror of :meth:`OnePassword.list_vaults`.
+
+        >>> import asyncio
+        >>> from op_core import AsyncInMemoryBackend, AsyncOnePassword, Item
+        >>> a = Item(id='i1', title='T', vault_id='v1', vault_name='Personal',
+        ...          category='LOGIN', tags=(), sections=(), fields=())
+        >>> op = AsyncOnePassword(AsyncInMemoryBackend(items=[a]))
+        >>> asyncio.run(op.list_vaults())
+        [VaultSummary(id='v1', name='Personal')]
+        """
+        return await self._backend.list_vaults()

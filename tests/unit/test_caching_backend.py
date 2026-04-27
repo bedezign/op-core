@@ -18,7 +18,7 @@ from op_core.backends.caching import (
     ttl_is_expired,
 )
 from op_core.exceptions import OpNotFoundError
-from op_core.items import Item, ItemRef, ItemSummary
+from op_core.items import Item, ItemRef, ItemSummary, VaultSummary
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,8 +52,9 @@ class StubBackend:
         self.read_count = 0
         self.get_item_count = 0
         self.list_items_count = 0
+        self.list_vaults_count = 0
 
-    def read(self, reference: str, *, default_value: str | None = None) -> str:
+    def read(self, reference: str, *, default_value: str | None = None, online: bool = True) -> str:
         self.read_count += 1
         if reference in self._refs:
             return self._refs[reference]
@@ -95,6 +96,14 @@ class StubBackend:
             return candidate
         raise OpNotFoundError(f"item not found: {item_id}")
 
+    def list_vaults(self) -> list[VaultSummary]:
+        self.list_vaults_count += 1
+        seen: dict[str, VaultSummary] = {}
+        for it in self._items:
+            if it.vault_id not in seen:
+                seen[it.vault_id] = VaultSummary(id=it.vault_id, name=it.vault_name)
+        return list(seen.values())
+
 
 class AsyncStubBackend:
     def __init__(
@@ -113,7 +122,11 @@ class AsyncStubBackend:
     def get_item_count(self) -> int:
         return self._sync.get_item_count
 
-    async def read(self, reference: str, *, default_value: str | None = None) -> str:
+    @property
+    def list_vaults_count(self) -> int:
+        return self._sync.list_vaults_count
+
+    async def read(self, reference: str, *, default_value: str | None = None, online: bool = True) -> str:
         return self._sync.read(reference, default_value=default_value)
 
     async def list_items(
@@ -127,6 +140,9 @@ class AsyncStubBackend:
 
     async def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
         return self._sync.get_item(item, vault=vault)
+
+    async def list_vaults(self) -> list[VaultSummary]:
+        return self._sync.list_vaults()
 
 
 def _entry(key: str, value: Any = "v") -> CacheEntry:
@@ -380,6 +396,21 @@ class TestCachingBackendPassthrough:
         cache.list_items()
         assert len(cache._store) == 0
 
+    def test_list_vaults_always_passes_through(self) -> None:
+        item = _make_item("abc")
+        inner = StubBackend(items=[item])
+        cache = CachingBackend(inner)
+        cache.list_vaults()
+        cache.list_vaults()
+        cache.list_vaults()
+        assert inner.list_vaults_count == 3
+
+    def test_list_vaults_does_not_store_anything(self) -> None:
+        inner = StubBackend(items=[_make_item("abc")])
+        cache = CachingBackend(inner)
+        cache.list_vaults()
+        assert len(cache._store) == 0
+
 
 # ---------------------------------------------------------------------------
 # CachingBackend.clear / clear_misses
@@ -466,6 +497,13 @@ class TestAsyncCachingBackend:
         await cache.list_items()
         await cache.list_items()
         assert inner._sync.list_items_count == 2
+
+    async def test_list_vaults_passthrough(self) -> None:
+        inner = AsyncStubBackend(items=[_make_item("abc")])
+        cache = AsyncCachingBackend(inner)
+        await cache.list_vaults()
+        await cache.list_vaults()
+        assert inner.list_vaults_count == 2
 
     async def test_concurrent_reads_share_result(self) -> None:
         # Two coroutines reading the same key serially (after each other)

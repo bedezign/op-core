@@ -24,7 +24,7 @@ from op_core.exceptions import (
     OpNotFoundError,
     OpTimeoutError,
 )
-from op_core.items import Item, ItemSummary
+from op_core.items import Item, ItemSummary, VaultSummary
 
 # Captured verbatim from `op read op://V/I/website` against a real desktop-auth
 # vault where the item exists but the field has been removed. Contract fixture:
@@ -494,6 +494,65 @@ class TestCLIBackendListItems:
         assert {s.category for s in result} == {"SSH_KEY", "SECURE_NOTE"}
 
 
+class TestCLIBackendListVaults:
+    def test_empty_account(self, recorder):
+        recorder.set_result(FakeCompleted(0, "[]"))
+        result = CLIBackend().list_vaults()
+        assert result == []
+        assert recorder.calls[0]["args"][1:] == ["vault", "list", "--format", "json"]
+
+    def test_parses_vaults(self, recorder):
+        payload = json.dumps(
+            [
+                {"id": "vqxm5hdjdy3f7hfgbk5p3ybrqe", "name": "Personal", "content_version": 1},
+                {"id": "vp6yqr5lhblk4gctaaprynwv2u", "name": "Shared", "content_version": 7},
+            ]
+        )
+        recorder.set_result(FakeCompleted(0, payload))
+        result = CLIBackend().list_vaults()
+        assert result == [
+            VaultSummary(id="vqxm5hdjdy3f7hfgbk5p3ybrqe", name="Personal"),
+            VaultSummary(id="vp6yqr5lhblk4gctaaprynwv2u", name="Shared"),
+        ]
+
+    def test_returns_vault_summary_instances(self, recorder):
+        payload = json.dumps([{"id": "v1", "name": "P"}])
+        recorder.set_result(FakeCompleted(0, payload))
+        result = CLIBackend().list_vaults()
+        assert all(isinstance(v, VaultSummary) for v in result)
+
+    def test_timeout_propagates(self, recorder):
+        recorder.set_result(subprocess.TimeoutExpired(cmd="op", timeout=1))
+        with pytest.raises(OpTimeoutError):
+            CLIBackend().list_vaults()
+
+    def test_auth_error_propagates(self, recorder):
+        recorder.set_result(FakeCompleted(1, "", "[ERROR] you are not currently signed in"))
+        with pytest.raises(OpAuthError):
+            CLIBackend().list_vaults()
+
+    def test_against_real_op_payload(self, recorder):
+        # Captured from `op vault list --format json` shape (sanitized: ids
+        # synthetic, schema preserved). Includes content_version which the
+        # parser ignores, so the contract test stays faithful to the op CLI
+        # output rather than the parser's minimum required keys.
+        op_vault_list_payload = json.dumps(
+            [
+                {"id": "vqxm5hdjdy3f7hfgbk5p3ybrqe", "name": "Personal", "content_version": 47},
+                {"id": "vp6yqr5lhblk4gctaaprynwv2u", "name": "Shared", "content_version": 12},
+                {"id": "vh7yqr5lhblk4gctaaprynwv8e", "name": "Work", "content_version": 1},
+            ]
+        )
+        recorder.set_result(FakeCompleted(0, op_vault_list_payload))
+        result = CLIBackend().list_vaults()
+        assert {v.id for v in result} == {
+            "vqxm5hdjdy3f7hfgbk5p3ybrqe",
+            "vp6yqr5lhblk4gctaaprynwv2u",
+            "vh7yqr5lhblk4gctaaprynwv8e",
+        }
+        assert {v.name for v in result} == {"Personal", "Shared", "Work"}
+
+
 class TestCLIBackendGetItem:
     def _make_item_json(self, *, item_id="itm1", vault_id="v1") -> str:
         return json.dumps(
@@ -896,3 +955,38 @@ class TestAsyncCLIBackendGetItem:
         args = arecorder.calls[0]["args"]
         assert args[1:4] == ["item", "get", "itm1"]
         assert args[args.index("--vault") + 1] == "v1"
+
+
+class TestAsyncCLIBackendListVaults:
+    async def test_empty_account(self, arecorder):
+        arecorder.set_result(FakeProcess(0, b"[]"))
+        result = await AsyncCLIBackend().list_vaults()
+        assert result == []
+        assert arecorder.calls[0]["args"][1:] == ["vault", "list", "--format", "json"]
+
+    async def test_parses_vaults(self, arecorder):
+        payload = json.dumps(
+            [
+                {"id": "v1", "name": "Personal", "content_version": 1},
+                {"id": "v2", "name": "Shared", "content_version": 7},
+            ]
+        ).encode()
+        arecorder.set_result(FakeProcess(0, payload))
+        result = await AsyncCLIBackend().list_vaults()
+        assert result == [
+            VaultSummary(id="v1", name="Personal"),
+            VaultSummary(id="v2", name="Shared"),
+        ]
+
+    async def test_timeout_kills_process(self, arecorder):
+        hanging = FakeProcess(hang=True)
+        arecorder.set_result(hanging)
+        backend = AsyncCLIBackend(timeout=0.05)
+        with pytest.raises(OpTimeoutError):
+            await backend.list_vaults()
+        assert hanging.killed
+
+    async def test_auth_error_propagates(self, arecorder):
+        arecorder.set_result(FakeProcess(1, b"", b"[ERROR] you are not currently signed in"))
+        with pytest.raises(OpAuthError):
+            await AsyncCLIBackend().list_vaults()

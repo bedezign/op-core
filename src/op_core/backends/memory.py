@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 
 from op_core.backends._filters import validate_filter
 from op_core.exceptions import OpNotFoundError, OpOfflineError
-from op_core.items import Item, ItemRef, ItemSummary
+from op_core.items import Item, ItemRef, ItemSummary, VaultSummary
 
 # Prefix-based check (not substring '://' in value) so legitimate URL field
 # values like "https://example.com" still get indexed as literals.
@@ -58,6 +58,22 @@ def _to_summary(item: Item) -> ItemSummary:
         category=item.category,
         tags=item.tags,
     )
+
+
+def _vaults_from_items(items: Iterable[Item]) -> list[VaultSummary]:
+    """Derive an ordered, deduped vault list from seeded items.
+
+    First-seen wins on collisions: if two items disagree on ``vault_name``
+    for the same ``vault_id``, the first item's name is kept and the
+    second is silently ignored. Real items from the same vault always
+    carry the same name; the rule guards the dedup contract rather than
+    a real-world scenario.
+    """
+    seen: dict[str, VaultSummary] = {}
+    for item in items:
+        if item.vault_id not in seen:
+            seen[item.vault_id] = VaultSummary(id=item.vault_id, name=item.vault_name)
+    return list(seen.values())
 
 
 def _build_item_index(items: Iterable[Item]) -> dict[str, str]:
@@ -172,6 +188,9 @@ class InMemoryBackend:
             return candidate
         raise OpNotFoundError(f"item not found: {item_id}")
 
+    def list_vaults(self) -> list[VaultSummary]:
+        return _vaults_from_items(self._items)
+
 
 class AsyncInMemoryBackend:
     """Async mirror of :class:`InMemoryBackend`."""
@@ -213,7 +232,7 @@ class AsyncInMemoryBackend:
             raise OpOfflineError(f"reference not available offline: {reference}")
         raise OpNotFoundError(f"reference not found: {reference}")
 
-    async def list_items(
+    async def list_items(  # NOSONAR python:S7503 — async required for AsyncBackend protocol conformance
         self,
         *,
         vault: str | None = None,
@@ -235,7 +254,7 @@ class AsyncInMemoryBackend:
             result.append(_to_summary(item))
         return result
 
-    async def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
+    async def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:  # NOSONAR python:S7503 — async required for AsyncBackend protocol conformance
         item_id = item if isinstance(item, str) else item.id
         effective_vault = vault
         if effective_vault is None and not isinstance(item, str):
@@ -247,3 +266,6 @@ class AsyncInMemoryBackend:
                 continue
             return candidate
         raise OpNotFoundError(f"item not found: {item_id}")
+
+    async def list_vaults(self) -> list[VaultSummary]:  # NOSONAR python:S7503 — async required for AsyncBackend protocol conformance
+        return _vaults_from_items(self._items)

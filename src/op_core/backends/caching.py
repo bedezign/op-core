@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from op_core.exceptions import OpNotFoundError, OpOfflineError
-from op_core.items import Item, ItemRef, ItemSummary
+from op_core.items import Item, ItemRef, ItemSummary, VaultSummary
 
 if TYPE_CHECKING:
     from op_core.backends.base import AsyncBackend, Backend
@@ -156,7 +156,7 @@ class CachingBackend:
             return self._unpack_read(entry, reference, default_value)
 
         if not online:
-            raise OpOfflineError(f'reference not cached: {reference}')
+            raise OpOfflineError(f"reference not cached: {reference}")
 
         try:
             value: Any = self._inner.read(reference)
@@ -176,6 +176,9 @@ class CachingBackend:
         categories: Sequence[str] | None = None,
     ) -> list[ItemSummary]:
         return self._inner.list_items(vault=vault, tags=tags, categories=categories)
+
+    def list_vaults(self) -> list[VaultSummary]:
+        return self._inner.list_vaults()
 
     def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
         key = _item_cache_key(item, vault)
@@ -268,7 +271,7 @@ class AsyncCachingBackend:
             return entry.value
 
         if not online:
-            raise OpOfflineError(f'reference not cached: {reference}')
+            raise OpOfflineError(f"reference not cached: {reference}")
 
         try:
             value: Any = await self._inner.read(reference)
@@ -288,6 +291,9 @@ class AsyncCachingBackend:
         categories: Sequence[str] | None = None,
     ) -> list[ItemSummary]:
         return await self._inner.list_items(vault=vault, tags=tags, categories=categories)
+
+    async def list_vaults(self) -> list[VaultSummary]:
+        return await self._inner.list_vaults()
 
     async def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
         key = _item_cache_key(item, vault)

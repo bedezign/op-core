@@ -5,6 +5,13 @@ All notable changes to op-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-04-27
+
+### Added
+
+- **`list_vaults()`** on `OnePassword` / `AsyncOnePassword` and on every backend (CLI, SDK, in-memory, caching, sync + async). Returns `list[VaultSummary]` for per-vault scoping of subsequent `list_items()` calls — significantly faster on accounts with many vaults.
+- **`VaultSummary(id, name)`** — frozen dataclass exported from `op_core`. The lightweight vault view returned by `list_vaults`.
+
 ## [0.1.0] — Initial release
 
 ### Added

@@ -5,12 +5,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from op_core.backends import AsyncBackend, Backend
-from op_core.items import Item, ItemRef, ItemSummary
+from op_core.items import Item, ItemRef, ItemSummary, VaultSummary
 
 
 class _MinimalSyncBackend:
     def read(self, reference: str, *, default_value: str | None = None) -> str:
-        return ''
+        return ""
 
     def list_items(
         self,
@@ -21,13 +21,16 @@ class _MinimalSyncBackend:
     ) -> list[ItemSummary]:
         return []
 
+    def list_vaults(self) -> list[VaultSummary]:
+        return []
+
     def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
         raise NotImplementedError
 
 
 class _MinimalAsyncBackend:
     async def read(self, reference: str, *, default_value: str | None = None) -> str:
-        return ''
+        return ""
 
     async def list_items(
         self,
@@ -38,13 +41,16 @@ class _MinimalAsyncBackend:
     ) -> list[ItemSummary]:
         return []
 
+    async def list_vaults(self) -> list[VaultSummary]:
+        return []
+
     async def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
         raise NotImplementedError
 
 
 class _MissingMethod:
     def read(self, reference: str, *, default_value: str | None = None) -> str:
-        return ''
+        return ""
 
     def list_items(self, **kwargs) -> list[ItemSummary]:
         return []

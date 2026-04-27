@@ -109,5 +109,18 @@ class ItemSummary:
     tags: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class VaultSummary:
+    """Lightweight view of a vault, returned by ``list_vaults``.
+
+    Carries only id and name — enough to scope a subsequent ``list_items``
+    call to a single vault, which is dramatically faster on accounts with
+    thousands of items spread across many vaults.
+    """
+
+    id: str
+    name: str
+
+
 ItemRef = str | ItemSummary | Item
 """Anything that identifies an item: a bare id, a summary, or a full item."""

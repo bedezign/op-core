@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import urllib.parse
 from dataclasses import dataclass, replace
+from typing import cast
 
 OP_PREFIX = 'op://'
 OPS_PREFIX = 'ops://'
@@ -141,7 +142,7 @@ class OpRef:
 
     def with_field(self, field_path: str) -> OpRef:
         """Return a new :class:`OpRef` with the given field path."""
-        return replace(self, field_path=field_path)
+        return cast(OpRef, replace(self, field_path=field_path))
 
     def as_absolute(self, vault_id: str | None = None, item_id: str | None = None) -> OpRef:
         """Return an absolute copy of this reference.
@@ -161,8 +162,8 @@ class OpRef:
         if self.is_item_relative:
             if item_id is None:
                 raise ValueError(f'item_id required to resolve {self.for_storage()}')
-            return replace(self, vault=vault_id, item=item_id)
-        return replace(self, vault=vault_id)
+            return cast(OpRef, replace(self, vault=vault_id, item=item_id))
+        return cast(OpRef, replace(self, vault=vault_id))
 
     def for_op(self) -> str:
         """Emit URI for the op CLI: always op:// prefix, %2F-encoded names."""

@@ -31,7 +31,7 @@ from op_core.exceptions import (
     OpOfflineError,
     OpTimeoutError,
 )
-from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary
+from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
 
 _DEFAULT_AUTH = DesktopAuth()
 
@@ -81,6 +81,10 @@ def _normalize_tags(raw: Any) -> tuple[str, ...]:
             if isinstance(name, str):
                 result.append(name)
     return tuple(result)
+
+
+def _parse_vault_summary(data: dict[str, Any]) -> VaultSummary:
+    return VaultSummary(id=data["id"], name=data.get("name", ""))
 
 
 def _parse_item_summary(data: dict[str, Any]) -> ItemSummary:
@@ -209,6 +213,10 @@ class CLIBackend:
             args += ["--vault", effective_vault]
         return _parse_item(json.loads(self._run(args)))
 
+    def list_vaults(self) -> list[VaultSummary]:
+        payload = json.loads(self._run(["vault", "list", "--format", "json"]))
+        return [_parse_vault_summary(entry) for entry in payload]
+
 
 class AsyncCLIBackend:
     """Backend that invokes ``op`` via :func:`asyncio.create_subprocess_exec`.
@@ -308,3 +316,7 @@ class AsyncCLIBackend:
         if effective_vault is not None:
             args += ["--vault", effective_vault]
         return _parse_item(json.loads(await self._arun(args)))
+
+    async def list_vaults(self) -> list[VaultSummary]:
+        payload = json.loads(await self._arun(["vault", "list", "--format", "json"]))
+        return [_parse_vault_summary(entry) for entry in payload]
