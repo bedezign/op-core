@@ -35,11 +35,11 @@ from op_core.field import (
     is_sensitive,
     normalize_original,
 )
-from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
+from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, ItemURL, VaultSummary
 from op_core.opref import OpRef
 from op_core.strings import expand_braces
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 __all__ = (  # noqa: RUF022 — semantic grouping intentional
     # Version
@@ -70,6 +70,7 @@ __all__ = (  # noqa: RUF022 — semantic grouping intentional
     "Item",
     "ItemField",
     "ItemSection",
+    "ItemURL",
     "ItemSummary",
     "ItemRef",
     "VaultSummary",

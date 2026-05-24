@@ -31,7 +31,7 @@ from op_core.exceptions import (
     OpOfflineError,
     OpTimeoutError,
 )
-from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
+from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, ItemURL, VaultSummary
 
 _DEFAULT_AUTH = DesktopAuth()
 
@@ -112,6 +112,20 @@ def _parse_item(data: dict[str, Any]) -> Item:
         )
         for f in data.get("fields", [])
     )
+    # ``label`` and ``primary`` are optional in op's JSON; ``href`` is the
+    # only required key — entries lacking it are dropped (an URL with no
+    # destination carries no signal a consumer can act on). Missing or
+    # empty ``label`` becomes the 1Password convention ``"website"`` (the
+    # default label the UI shows for an unlabeled URL).
+    urls = tuple(
+        ItemURL(
+            href=u["href"],
+            label=u.get("label") or "website",
+            primary=bool(u.get("primary", False)),
+        )
+        for u in data.get("urls", [])
+        if u.get("href")
+    )
     return Item(
         id=data["id"],
         title=data["title"],
@@ -121,6 +135,7 @@ def _parse_item(data: dict[str, Any]) -> Item:
         tags=_normalize_tags(data.get("tags")),
         sections=sections,
         fields=fields,
+        urls=urls,
     )
 
 

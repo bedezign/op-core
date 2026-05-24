@@ -6,7 +6,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
+from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, ItemURL, VaultSummary
 
 
 class TestItemSection:
@@ -50,6 +50,38 @@ class TestItemField:
         field = ItemField(id="f1", label="pw", value="x", type="CONCEALED", section_id=None)
         with pytest.raises(FrozenInstanceError):
             field.value = "changed"  # type: ignore[misc]
+
+
+class TestItemURL:
+    def test_construction_with_all_fields(self):
+        url = ItemURL(href="https://github.com", label="website", primary=True)
+        assert url.href == "https://github.com"
+        assert url.label == "website"
+        assert url.primary is True
+
+    def test_label_and_primary_default(self):
+        """Only href is required. Label defaults to '"website"' (1Password's UI
+        convention for an unlabeled URL); primary defaults to False."""
+        url = ItemURL(href="https://example.com")
+        assert url.label == "website"
+        assert url.primary is False
+
+    def test_frozen(self):
+        url = ItemURL(href="https://example.com")
+        with pytest.raises(FrozenInstanceError):
+            url.href = "https://changed.example.com"  # type: ignore[misc]
+
+    def test_equality(self):
+        a = ItemSection(id="x", label="y")  # sanity: different types unequal
+        b = ItemURL(href="https://example.com", label="website", primary=True)
+        c = ItemURL(href="https://example.com", label="website", primary=True)
+        assert b == c
+        assert a != b
+
+    def test_hashable(self):
+        a = ItemURL(href="https://example.com", label="website", primary=True)
+        b = ItemURL(href="https://example.com", label="website", primary=True)
+        assert hash(a) == hash(b)
 
 
 class TestItem:
@@ -98,6 +130,23 @@ class TestItem:
         assert item.tags == ()
         assert item.sections == ()
         assert item.fields == ()
+
+    def test_urls_default_empty_for_backward_compat(self):
+        """Existing Item(...) callers that pre-date the urls field keep working."""
+        item = self._make_item()
+        assert item.urls == ()
+        assert isinstance(item.urls, tuple)
+
+    def test_urls_populated(self):
+        item = self._make_item(
+            urls=(
+                ItemURL(href="https://github.com", label="website", primary=True),
+                ItemURL(href="https://api.github.com", label="api", primary=False),
+            )
+        )
+        assert len(item.urls) == 2
+        assert all(isinstance(u, ItemURL) for u in item.urls)
+        assert item.urls[0].label == "website"
 
     def test_frozen(self):
         item = self._make_item()
@@ -195,6 +244,95 @@ class TestItemFieldLookup:
         top = item.top_level_fields()
         assert isinstance(top, tuple)
         assert {f.id for f in top} == {"f1", "f3"}
+
+
+class TestItemURLLookup:
+    def _make_item(self, urls: tuple[ItemURL, ...] = ()) -> Item:
+        return Item(
+            id="itm1",
+            title="GitHub",
+            vault_id="v1",
+            vault_name="Personal",
+            category="LOGIN",
+            tags=(),
+            sections=(),
+            fields=(),
+            urls=urls,
+        )
+
+    def test_url_found(self):
+        item = self._make_item(
+            urls=(
+                ItemURL(href="https://github.com", label="website", primary=True),
+                ItemURL(href="https://api.github.com", label="api", primary=False),
+            )
+        )
+        u = item.url("api")
+        assert u is not None
+        assert u.href == "https://api.github.com"
+
+    def test_url_missing(self):
+        item = self._make_item(urls=(ItemURL(href="https://github.com", label="website"),))
+        assert item.url("nope") is None
+
+    def test_url_is_case_sensitive(self):
+        item = self._make_item(urls=(ItemURL(href="https://github.com", label="website"),))
+        assert item.url("Website") is None
+        assert item.url("website") is not None
+
+    def test_url_matches_first_with_label_when_duplicates(self):
+        item = self._make_item(
+            urls=(
+                ItemURL(href="https://a.example.com", label="dup"),
+                ItemURL(href="https://b.example.com", label="dup"),
+            )
+        )
+        assert item.url("dup").href == "https://a.example.com"  # type: ignore[union-attr]
+
+    def test_url_with_no_urls_returns_none(self):
+        assert self._make_item().url("anything") is None
+
+    def test_unlabeled_url_matches_default_label(self):
+        """A URL constructed without a label has the default '"website"' and
+        is findable by that name — mirrors 1Password's UI convention."""
+        item = self._make_item(urls=(ItemURL(href="https://example.com"),))
+        assert item.url("website") is not None
+        assert item.url("") is None  # empty string is not the default
+
+    def test_primary_url_found(self):
+        item = self._make_item(
+            urls=(
+                ItemURL(href="https://a.example.com", label="alt", primary=False),
+                ItemURL(href="https://b.example.com", label="website", primary=True),
+            )
+        )
+        primary = item.primary_url()
+        assert primary is not None
+        assert primary.href == "https://b.example.com"
+
+    def test_primary_url_returns_first_when_multiple_marked(self):
+        item = self._make_item(
+            urls=(
+                ItemURL(href="https://a.example.com", primary=True),
+                ItemURL(href="https://b.example.com", primary=True),
+            )
+        )
+        primary = item.primary_url()
+        assert primary is not None
+        assert primary.href == "https://a.example.com"
+
+    def test_primary_url_returns_none_when_no_primary(self):
+        """Does not guess by falling back to the first entry."""
+        item = self._make_item(
+            urls=(
+                ItemURL(href="https://a.example.com", primary=False),
+                ItemURL(href="https://b.example.com", primary=False),
+            )
+        )
+        assert item.primary_url() is None
+
+    def test_primary_url_with_no_urls_returns_none(self):
+        assert self._make_item().primary_url() is None
 
 
 class TestItemSummary:

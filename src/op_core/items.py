@@ -35,6 +35,34 @@ class ItemField:
 
 
 @dataclass(frozen=True)
+class ItemURL:
+    """A URL entry on a 1Password item.
+
+    URLs live alongside ``fields`` and ``sections`` in the item payload but
+    are NOT addressable via ``op read`` — the CLI rejects
+    ``op://vault/item/<url-label>`` with a "not a field" error. They are
+    exposed here for read-only inspection, e.g. so a validator can
+    distinguish a URL label from a missing field name on the same item.
+
+    Defaults for ``label`` and ``primary`` mirror 1Password's UI convention:
+    an URL with no user-set label is shown as ``"website"``, and an URL
+    without an explicit primary marker is not the primary. Both backend
+    parsers populate these defaults when the source payload omits or
+    empties the corresponding field, so every parsed ``ItemURL`` carries a
+    non-empty label and a boolean ``primary``.
+
+    The ``primary`` flag is only populated meaningfully by the CLI backend.
+    The official 1Password SDK's ``Website`` type has no equivalent, so
+    URLs sourced via :class:`~op_core.backends.sdk.SDKBackend` always carry
+    ``primary=False``.
+    """
+
+    href: str
+    label: str = "website"
+    primary: bool = False
+
+
+@dataclass(frozen=True)
 class Item:
     """A 1Password item in its canonical, backend-agnostic form."""
 
@@ -46,6 +74,7 @@ class Item:
     tags: tuple[str, ...]
     sections: tuple[ItemSection, ...]
     fields: tuple[ItemField, ...]
+    urls: tuple[ItemURL, ...] = ()
 
     def field(self, label: str) -> ItemField | None:
         """Return the first field whose label matches ``label`` exactly, or ``None``.
@@ -57,6 +86,30 @@ class Item:
         for f in self.fields:
             if f.label == label:
                 return f
+        return None
+
+    def url(self, label: str) -> ItemURL | None:
+        """Return the first URL whose label matches ``label`` exactly, or ``None``.
+
+        Matching is case-sensitive. Labels in 1Password are user-controlled
+        strings; callers that want fuzzy matching should iterate ``urls``
+        directly.
+        """
+        for u in self.urls:
+            if u.label == label:
+                return u
+        return None
+
+    def primary_url(self) -> ItemURL | None:
+        """Return the first URL marked ``primary=True``, or ``None``.
+
+        Returns ``None`` when no URL is marked primary — does not guess by
+        falling back to the first entry. SDK-sourced items always return
+        ``None`` because the SDK does not expose the primary flag.
+        """
+        for u in self.urls:
+            if u.primary:
+                return u
         return None
 
     def fields_in(self, section: str | ItemSection) -> tuple[ItemField, ...]:

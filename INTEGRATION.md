@@ -87,7 +87,7 @@ from op_core import (
     Backend, AsyncBackend,                                      # protocols (for custom backends)
     detect_backend, detect_async_backend,                       # auto-detection
     Auth, ServiceAccountAuth, DesktopAuth, detect_auth,         # auth types
-    Item, ItemField, ItemSection, ItemSummary, ItemRef,         # canonical models
+    Item, ItemField, ItemSection, ItemURL, ItemSummary, ItemRef, # canonical models
     FieldValue, OpRef,                                          # references and field values
     classify_type, is_sensitive, normalize_original,            # field helpers
     complete_field_refs,                                        # reference completion
@@ -142,6 +142,20 @@ value = op.read("op://Personal/GitHub/token")  # -> str | None
 ```
 
 Returns `None` if the reference is not found. Raises `OpAuthError` / `OpTimeoutError` / `OpError` on transport failures.
+
+### Listing vaults
+
+```python
+vaults = op.list_vaults()
+# -> list[VaultSummary]  (each has id and name)
+
+# Vault ids are stable; names are user-controlled. For per-vault scoping,
+# resolve a name to an id once and reuse the id:
+ssh_vault_id = next(v.id for v in vaults if v.name == "SSH Hosts")
+items = op.list_items(vault=ssh_vault_id)
+```
+
+Per-vault scoping is significantly faster than the unscoped form on accounts with many vaults — especially with `SDKBackend`, where the unscoped path enumerates vaults and lists each.
 
 ### Listing items
 
@@ -306,6 +320,9 @@ All five inherit from `OpError`, so a broad `except OpError` catches everything 
 - **`SDKBackend` only supports service-account auth.** Desktop auth is CLI-only.
 - **No `whoami` on the backend protocol.** If you need account identity info, look it up another way — the protocol stays narrow on purpose.
 - **Reference-valued fields are skipped during `InMemoryBackend` auto-indexing.** A field whose value starts with `op://` or `ops://` (e.g. a self-reference like `op://././username`) is NOT indexed as a literal — it requires backend resolution and falls through to the configured `fallback`. URLs (`https://...`) are still indexed as ordinary literals.
+- **`Item.urls` is exposed for inspection, not resolution.** The 1Password CLI rejects `op read op://vault/item/<url-label>` with a "not a field" error, so `InMemoryBackend` does not address URL labels via `read()`. Inspect `Item.urls` directly (or use `Item.url(label)` / `Item.primary_url()`) to distinguish a URL-label token from a missing field on the same item.
+- **Every parsed `ItemURL` has a non-empty label.** When the source payload omits or empties the label, op-core fills in `"website"` — the same default 1Password's UI shows. This means a Login item's unlabeled URLs are findable as `item.url("website")` regardless of how the user did or did not name them, but it also means `item.url("website")` may match URLs that weren't *the* "website" — use `item.primary_url()` when you specifically want the primary URL.
+- **`ItemURL.primary` is not populated by the SDK backend.** The SDK's `Website` type has no equivalent flag, so SDK-sourced URLs always carry `primary=False` and `Item.primary_url()` returns `None`. Use `CLIBackend` when the primary marker matters.
 
 ## Where to look next
 

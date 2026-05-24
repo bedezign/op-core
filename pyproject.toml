@@ -1,6 +1,6 @@
 [project]
 name = "op-core"
-version = "0.2.0"
+version = "0.3.0"
 description = "Backend-agnostic Python toolkit for 1Password: op:// resolution, sync/async API, swappable backends for CLI, SDK, and tests."
 readme = "README.md"
 license = "Apache-2.0"

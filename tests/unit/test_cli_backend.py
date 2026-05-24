@@ -24,7 +24,7 @@ from op_core.exceptions import (
     OpNotFoundError,
     OpTimeoutError,
 )
-from op_core.items import Item, ItemSummary, VaultSummary
+from op_core.items import Item, ItemSummary, ItemURL, VaultSummary
 
 # Captured verbatim from `op read op://V/I/website` against a real desktop-auth
 # vault where the item exists but the field has been removed. Contract fixture:
@@ -218,6 +218,209 @@ class TestParseItem:
         assert item.tags == ()
         assert item.sections == ()
         assert item.fields == ()
+        assert item.urls == ()
+
+    def test_urls_labeled_primary(self):
+        # Captured shape from `op item get --format json`: per-URL entries
+        # carry `label`, `primary`, `href`. `label` and `primary` are
+        # optional; `href` is the only guaranteed key.
+        data = {
+            "id": "itm1",
+            "title": "Homelab NAS",
+            "vault": {"id": "v1", "name": "Personal"},
+            "category": "LOGIN",
+            "urls": [{"label": "website", "primary": True, "href": "nas.example.com"}],
+        }
+        item = _parse_item(data)
+        assert item.urls == (ItemURL(href="nas.example.com", label="website", primary=True),)
+
+    def test_urls_unlabeled_and_not_primary(self):
+        """When `label` and `primary` are absent in op's JSON, label defaults
+        to '"website"' (1Password's UI convention) and primary defaults to False."""
+        data = {
+            "id": "itm1",
+            "title": "T",
+            "vault": {"id": "v1", "name": "P"},
+            "category": "LOGIN",
+            "urls": [{"href": "https://example.com"}],
+        }
+        item = _parse_item(data)
+        assert len(item.urls) == 1
+        u = item.urls[0]
+        assert u.href == "https://example.com"
+        assert u.label == "website"
+        assert u.primary is False
+
+    def test_urls_empty_label_string_defaults_to_website(self):
+        """An explicit empty-string label is treated the same as missing —
+        both fall back to the 1Password default '"website"'."""
+        data = {
+            "id": "itm1",
+            "title": "T",
+            "vault": {"id": "v1", "name": "P"},
+            "category": "LOGIN",
+            "urls": [{"label": "", "href": "https://example.com"}],
+        }
+        item = _parse_item(data)
+        assert item.urls[0].label == "website"
+
+    def test_urls_missing_href_skipped(self):
+        """An URL entry with no `href` carries no destination — drop it."""
+        data = {
+            "id": "itm1",
+            "title": "T",
+            "vault": {"id": "v1", "name": "P"},
+            "category": "LOGIN",
+            "urls": [
+                {"label": "broken", "primary": True},  # no href — skipped
+                {"label": "good", "href": "https://ok.example.com"},
+            ],
+        }
+        item = _parse_item(data)
+        assert len(item.urls) == 1
+        assert item.urls[0].label == "good"
+
+    def test_urls_empty_href_skipped(self):
+        data = {
+            "id": "itm1",
+            "title": "T",
+            "vault": {"id": "v1", "name": "P"},
+            "category": "LOGIN",
+            "urls": [{"label": "empty", "href": ""}],
+        }
+        assert _parse_item(data).urls == ()
+
+    def test_urls_none_href_skipped(self):
+        # None is falsy — same filter path as a missing key, but explicit coverage
+        # confirms the parser doesn't branch on type.
+        data = {
+            "id": "itm1",
+            "title": "T",
+            "vault": {"id": "v1", "name": "P"},
+            "category": "LOGIN",
+            "urls": [{"label": "x", "href": None}],
+        }
+        assert _parse_item(data).urls == ()
+
+    def test_urls_unicode_label(self):
+        data = {
+            "id": "itm1",
+            "title": "T",
+            "vault": {"id": "v1", "name": "P"},
+            "category": "LOGIN",
+            "urls": [{"label": "サイト", "href": "https://example.jp"}],
+        }
+        item = _parse_item(data)
+        assert len(item.urls) == 1
+        assert item.urls[0].label == "サイト"
+        assert item.urls[0].href == "https://example.jp"
+
+    def test_multiple_urls_preserve_order(self):
+        data = {
+            "id": "itm1",
+            "title": "T",
+            "vault": {"id": "v1", "name": "P"},
+            "category": "LOGIN",
+            "urls": [
+                {"label": "primary-site", "primary": True, "href": "https://a.example.com"},
+                {"label": "mirror", "href": "https://b.example.com"},
+                {"href": "https://c.example.com"},
+            ],
+        }
+        item = _parse_item(data)
+        assert [u.href for u in item.urls] == [
+            "https://a.example.com",
+            "https://b.example.com",
+            "https://c.example.com",
+        ]
+        assert [u.primary for u in item.urls] == [True, False, False]
+
+    def test_urls_primary_is_not_always_first(self):
+        # Captured shape (sanitized hrefs) from a real `op item get` JSON
+        # response. The `primary` entry is *last* and the two preceding
+        # entries omit both `label` and `primary` entirely. Guards against
+        # any future temptation to infer primacy from list position — the
+        # explicit flag is the only authoritative marker.
+        data = {
+            "id": "itm1",
+            "title": "Storage",
+            "vault": {"id": "v1", "name": "P"},
+            "category": "LOGIN",
+            "urls": [
+                {"href": "https://storage.example.com/"},
+                {"href": "https://storage/"},
+                {"label": "website", "primary": True, "href": "nas.example.com"},
+            ],
+        }
+        item = _parse_item(data)
+        assert len(item.urls) == 3
+        # Order is preserved...
+        assert [u.href for u in item.urls] == [
+            "https://storage.example.com/",
+            "https://storage/",
+            "nas.example.com",
+        ]
+        # ...but primary is identified by the flag, not by position.
+        assert [u.primary for u in item.urls] == [False, False, True]
+        primary = item.primary_url()
+        assert primary is not None
+        assert primary.href == "nas.example.com"
+        # The two unlabeled entries default to label='website' (1Password's UI
+        # convention) — same as if the user had typed "website" explicitly.
+        assert item.urls[0].label == "website"
+        assert item.urls[1].label == "website"
+
+    def test_urls_against_real_op_payload(self):
+        # Captured from `op item get <id> --format json` against a real
+        # desktop-auth vault (sanitized: ids/hrefs synthetic, schema preserved).
+        # Reproduces the trigger that motivated this change: a LOGIN item whose
+        # `host` field stores `op://././website` — the `website` token is the
+        # label of a primary URL on the same item, not a field, so the CLI
+        # rejects `op read op://V/I/website`. After the URL is exposed on
+        # Item.urls, a validator can distinguish "URL label" from "missing field"
+        # without re-fetching the raw JSON.
+        op_item_get_payload = {
+            "id": "axhomelabnas000000000000000",
+            "title": "Homelab NAS",
+            "version": 3,
+            "vault": {"id": "vqxm5hdjdy3f7hfgbk5p3ybrqe", "name": "Personal"},
+            "category": "LOGIN",
+            "last_edited_by": "U7JFCKH5RJB5RFEVBYZWLA4SUI",
+            "created_at": "2024-01-15T10:11:12Z",
+            "updated_at": "2024-08-30T07:21:33Z",
+            "additional_information": "admin",
+            "urls": [
+                {"label": "website", "primary": True, "href": "nas.example.com"},
+                {"label": "admin", "href": "https://nas.example.com:8443"},
+            ],
+            "sections": [],
+            "fields": [
+                {
+                    "id": "host",
+                    "label": "host",
+                    "value": "op://././website",
+                    "type": "STRING",
+                },
+                {
+                    "id": "username",
+                    "label": "username",
+                    "value": "admin",
+                    "type": "STRING",
+                },
+            ],
+            "tags": [],
+        }
+        item = _parse_item(op_item_get_payload)
+        assert len(item.urls) == 2
+        assert item.url("website") is not None
+        primary = item.primary_url()
+        assert primary is not None
+        assert primary.href == "nas.example.com"
+        # And the field that references it is still parsed normally — both
+        # facts coexist on the same Item.
+        host = item.field("host")
+        assert host is not None
+        assert host.value == "op://././website"
 
 
 # ---------- CLIBackend ----------
@@ -955,6 +1158,33 @@ class TestAsyncCLIBackendGetItem:
         args = arecorder.calls[0]["args"]
         assert args[1:4] == ["item", "get", "itm1"]
         assert args[args.index("--vault") + 1] == "v1"
+
+    async def test_get_item_urls_propagated(self, arecorder):
+        # Verifies the async path flows through _parse_item and surfaces URLs on
+        # the returned Item. Two entries: one primary, one not.
+        payload = json.dumps(
+            {
+                "id": "itm1",
+                "title": "Multi-URL",
+                "vault": {"id": "v1", "name": "P"},
+                "category": "LOGIN",
+                "tags": [],
+                "sections": [],
+                "fields": [],
+                "urls": [
+                    {"label": "website", "primary": True, "href": "https://example.com"},
+                    {"label": "api", "primary": False, "href": "https://api.example.com"},
+                ],
+            }
+        ).encode()
+        arecorder.set_result(FakeProcess(0, payload))
+        item = await AsyncCLIBackend().get_item("itm1")
+        assert len(item.urls) == 2
+        assert item.urls[0] == ItemURL(href="https://example.com", label="website", primary=True)
+        assert item.urls[1] == ItemURL(href="https://api.example.com", label="api", primary=False)
+        primary = item.primary_url()
+        assert primary is not None
+        assert primary.href == "https://example.com"
 
 
 class TestAsyncCLIBackendListVaults:

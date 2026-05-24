@@ -49,13 +49,13 @@ from op_core.exceptions import (
     OpOfflineError,
     OpTimeoutError,
 )
-from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
+from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, ItemURL, VaultSummary
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
 
 _INTEGRATION_NAME = "op-core"
-_INTEGRATION_VERSION = "0.1.0"
+_INTEGRATION_VERSION = "0.3.0"
 
 _AUTH_PHRASES = (
     "unauthorized",
@@ -150,6 +150,14 @@ def _sdk_item_to_canonical(sdk_item: Any) -> Item:
     values (e.g. ``"Concealed"``, ``"Text"``). Empty string values are
     mapped to ``None`` on the canonical ``ItemField`` to match the CLI
     backend's nullable-value shape.
+
+    URLs are sourced from ``sdk_item.websites`` (the SDK's term for what
+    the CLI calls ``urls``) and mapped to :class:`ItemURL`. Missing or
+    empty labels are populated with the convention ``"website"`` (matching
+    the CLI parser). The SDK's ``Website`` type has no ``primary`` flag —
+    only ``url``, ``label``, and ``autofill_behavior`` — so every
+    SDK-sourced URL carries ``primary=False``. Callers that need the
+    primary marker must use :class:`~op_core.backends.cli.CLIBackend`.
     """
     sections = tuple(
         ItemSection(id=s.id, label=getattr(s, "title", "") or "") for s in getattr(sdk_item, "sections", []) or []
@@ -164,6 +172,15 @@ def _sdk_item_to_canonical(sdk_item: Any) -> Item:
         )
         for f in getattr(sdk_item, "fields", []) or []
     )
+    urls = tuple(
+        ItemURL(
+            href=getattr(w, "url", "") or "",
+            label=(getattr(w, "label", "") or "website"),
+            primary=False,
+        )
+        for w in getattr(sdk_item, "websites", []) or []
+        if getattr(w, "url", "")
+    )
     return Item(
         id=sdk_item.id,
         title=sdk_item.title,
@@ -173,6 +190,7 @@ def _sdk_item_to_canonical(sdk_item: Any) -> Item:
         tags=tuple(getattr(sdk_item, "tags", ()) or ()),
         sections=sections,
         fields=fields,
+        urls=urls,
     )
 
 

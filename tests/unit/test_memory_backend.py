@@ -6,7 +6,7 @@ import pytest
 
 from op_core.backends.memory import AsyncInMemoryBackend, InMemoryBackend
 from op_core.exceptions import OpNotFoundError, OpOfflineError
-from op_core.items import Item, ItemField, ItemSection, ItemSummary, VaultSummary
+from op_core.items import Item, ItemField, ItemSection, ItemSummary, ItemURL, VaultSummary
 
 
 def _make_item(
@@ -465,6 +465,31 @@ class TestItemAutoIndex:
         backend = InMemoryBackend(items=[item])
         with pytest.raises(OpNotFoundError):
             backend.read("op://v1/itm1/hostname")
+
+    def test_url_label_not_addressable_via_read(self):
+        # Item.urls is exposed for inspection but is NOT a resolution target.
+        # The 1Password CLI rejects `op read op://V/I/<url-label>` with a
+        # "not a field" error — InMemoryBackend must match that contract so
+        # callers do not get inconsistent results across backends. Without a
+        # fallback, the read surfaces as a clean miss.
+        item = Item(
+            id="itm1",
+            title="Homelab NAS",
+            vault_id="v1",
+            vault_name="Personal",
+            category="LOGIN",
+            tags=(),
+            sections=(),
+            fields=(ItemField(id="f1", label="username", value="admin", type="STRING", section_id=None),),
+            urls=(ItemURL(href="nas.example.com", label="website", primary=True),),
+        )
+        backend = InMemoryBackend(items=[item])
+        # Field is addressable as usual.
+        assert backend.read("op://v1/itm1/username") == "admin"
+        # URL label is NOT addressable — this is the contract that justifies
+        # exposing Item.urls on the model in the first place.
+        with pytest.raises(OpNotFoundError):
+            backend.read("op://v1/itm1/website")
 
     def test_duplicate_label_with_reference_falls_through_to_literal(self):
         # Real-world shape: a top-level literal field "username"='root' plus a

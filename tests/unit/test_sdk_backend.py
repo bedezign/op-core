@@ -35,7 +35,7 @@ from op_core.exceptions import (
     OpNotFoundError,
     OpTimeoutError,
 )
-from op_core.items import Item, ItemSummary, VaultSummary
+from op_core.items import Item, ItemSummary, ItemURL, VaultSummary
 
 # ---------- minimal SDK-shaped fakes (Tier A) ----------
 
@@ -74,12 +74,22 @@ class FakeItem:
     tags: list[str] = field(default_factory=list)
     fields: list[FakeField] = field(default_factory=list)
     sections: list[FakeSection] = field(default_factory=list)
+    websites: list[FakeWebsite] = field(default_factory=list)
 
 
 @dataclass
 class FakeVaultOverview:
     id: str
     title: str = ""
+
+
+@dataclass
+class FakeWebsite:
+    """Mirror of ``onepassword.types.Website``: url + label + autofill_behavior, no primary."""
+
+    url: str
+    label: str = ""
+    autofill_behavior: str = "AnywhereOnWebsite"
 
 
 class FakeSecrets:
@@ -237,6 +247,63 @@ class TestMappingHelpers:
         assert canonical.fields[1].value is None
         assert canonical.fields[1].type == "Concealed"
         assert canonical.fields[1].section_id == "s1"
+
+    def test_item_to_canonical_with_websites(self):
+        fi = FakeItem(
+            id="i1",
+            title="GitHub",
+            vault_id="v1",
+            websites=[
+                FakeWebsite(url="https://github.com", label="website"),
+                FakeWebsite(url="https://api.github.com", label="api"),
+            ],
+        )
+        canonical = _sdk_item_to_canonical(fi)
+        # SDK Website carries no `primary` flag, so every SDK-sourced URL
+        # is mapped with primary=False. Documented limitation.
+        assert canonical.urls == (
+            ItemURL(href="https://github.com", label="website", primary=False),
+            ItemURL(href="https://api.github.com", label="api", primary=False),
+        )
+        assert canonical.primary_url() is None
+
+    def test_item_to_canonical_no_websites_attribute(self):
+        """Robust against an SDK shape where `websites` is missing entirely."""
+        fi = FakeItem(id="i1", title="T", vault_id="v1")
+        # Remove the attribute to simulate older SDK versions.
+        del fi.websites
+        canonical = _sdk_item_to_canonical(fi)
+        assert canonical.urls == ()
+
+    def test_item_to_canonical_website_with_empty_url_skipped(self):
+        fi = FakeItem(
+            id="i1",
+            title="T",
+            vault_id="v1",
+            websites=[FakeWebsite(url="", label="broken"), FakeWebsite(url="https://ok.example.com", label="good")],
+        )
+        canonical = _sdk_item_to_canonical(fi)
+        assert len(canonical.urls) == 1
+        assert canonical.urls[0].label == "good"
+
+    def test_item_to_canonical_website_with_empty_label_defaults_to_website(self):
+        """SDK ``Website.label`` is `str` (not optional) so empty string is the
+        SDK's "missing" sentinel. Mirror the CLI parser: fall back to the
+        1Password default '"website"'."""
+        fi = FakeItem(
+            id="i1",
+            title="T",
+            vault_id="v1",
+            websites=[FakeWebsite(url="https://example.com", label="")],
+        )
+        canonical = _sdk_item_to_canonical(fi)
+        assert canonical.urls[0].label == "website"
+
+    def test_item_to_canonical_website_missing_url_attribute(self):
+        # An object in websites that lacks the `url` attribute entirely (e.g. an
+        # older SDK version or a stub) must be dropped by the getattr guard.
+        fi = FakeItem(id="i1", title="T", vault_id="v1", websites=[object()])  # type: ignore[arg-type]  # deliberate bad-shape — pyright correctly flags it
+        assert _sdk_item_to_canonical(fi).urls == ()
 
 
 # ---------- AsyncSDKBackend ----------
@@ -423,6 +490,29 @@ class TestAsyncSDKBackendGetItem:
         backend = AsyncSDKBackend(_auth(), client=fc)
         with pytest.raises(OpNotFoundError):
             await backend.get_item("ghost", vault="v1")
+
+    async def test_get_item_urls_propagated(self):
+        # Verifies the async SDK path flows through _sdk_item_to_canonical and
+        # surfaces URLs on the returned Item. The SDK Website type has no `primary`
+        # flag, so all entries are mapped with primary=False.
+        fc = FakeClient()
+        fc.items.items_by_key[("v1", "i1")] = FakeItem(
+            id="i1",
+            title="GitHub",
+            vault_id="v1",
+            category="Login",
+            websites=[
+                FakeWebsite(url="https://github.com", label="website"),
+                FakeWebsite(url="https://api.github.com", label="api"),
+            ],
+        )
+        backend = AsyncSDKBackend(_auth(), client=fc)
+        item = await backend.get_item("i1", vault="v1")
+        assert len(item.urls) == 2
+        assert item.urls[0] == ItemURL(href="https://github.com", label="website", primary=False)
+        assert item.urls[1] == ItemURL(href="https://api.github.com", label="api", primary=False)
+        # SDK has no primary flag — primary_url() is always None for SDK-sourced items.
+        assert item.primary_url() is None
 
 
 # ---------- SDKBackend sync wrapper ----------

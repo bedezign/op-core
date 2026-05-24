@@ -77,6 +77,18 @@ fv = FieldValue.from_raw(
 value = op.resolve(fv)  # walks `||` segments, returns first hit
 ```
 
+### Listing vaults
+
+```python
+op = OnePassword()
+for vault in op.list_vaults():
+    print(vault.id, vault.name)
+
+# Per-vault scoping is dramatically faster on accounts with many vaults:
+ssh_vault = next(v for v in op.list_vaults() if v.name == "SSH Hosts")
+items = op.list_items(vault=ssh_vault.id)
+```
+
 ### List and fetch items
 
 ```python
@@ -174,7 +186,7 @@ See [`INTEGRATION.md`](INTEGRATION.md) for the full patterns, including item aut
 ## What ships
 
 - Full `op://` URI grammar — quoted segments, URL encoding, self-markers (`.`), `||` fallback chains.
-- Canonical models (`Item`, `ItemField`, `ItemSection`, `ItemSummary`) — interchangeable across backends.
+- Canonical models (`Item`, `ItemField`, `ItemSection`, `ItemURL`, `ItemSummary`) — interchangeable across backends.
 - `FieldValue` with sensitivity detection and `to_dict` / `from_dict` JSON persistence.
 - Service-account auth first-class via `ServiceAccountAuth.from_env()` (`OP_SERVICE_ACCOUNT_TOKEN`).
 - Type hints throughout (`py.typed` ships); strict pyright/mypy clean.
