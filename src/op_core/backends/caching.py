@@ -100,6 +100,10 @@ class _Store:
         for k in dead:
             del self._entries[k]
 
+    def items(self) -> list[tuple[str, CacheEntry]]:
+        """Snapshot of (key, entry) pairs in LRU order. For persistence/inspection."""
+        return list(self._entries.items())
+
     def __len__(self) -> int:
         return len(self._entries)
 

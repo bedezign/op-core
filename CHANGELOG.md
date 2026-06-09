@@ -5,6 +5,29 @@ All notable changes to op-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-06-09
+
+### Added
+
+- **`FileCachingBackend` / `AsyncFileCachingBackend`** — a persistent caching decorator that mirrors `CachingBackend` but writes the resolved reference→value map to a file with a TTL, so cache hits skip the wrapped backend (and thus skip `op` / the biometric prompt) **across separate process invocations**. The in-process `CachingBackend` does nothing for a short-lived CLI relaunched each run; this one lets repeated runs within a TTL window authenticate to 1Password at most once. Wraps any backend: `FileCachingBackend(CLIBackend(), ttl=300, path=...)`. Exported from `op_core`.
+  - **Wall-clock TTL.** Entries are stamped with `time.time()` (not the monotonic clock `CachingBackend` uses, which resets every process start), so the TTL is meaningful across runs.
+  - **Secret-aware storage.** The cache file holds resolved secret values, so it is written `0600` inside a `0700` directory, defaults to a RAM-backed location (`$XDG_RUNTIME_DIR/op-core/`, else `$TMPDIR/op-core-<uid>/`), is written atomically (temp file + `os.replace`), and is ignored on load if its ownership or permissions look tampered with. A corrupt or unreadable cache never crashes the caller — it degrades to the wrapped backend with a non-secret warning.
+  - Honours the same `max_entries` LRU cap and negative caching as `CachingBackend`. `ttl<=0` disables persistence (the backend becomes a pass-through). Only `read()` is persisted; `get_item` / `list_items` / `list_vaults` pass through.
+- **`default_cache_dir()`** — returns (creating `0700`) the directory persistent caches live in. Exported from `op_core`.
+- **`op-env` command** — a console entry point (behind the `[cli]` extra: `pip install 'op-core[cli]'`) that composes an environment, resolves any `op://` references in it via op-core, and then either execs a child process or prints the result. Two subcommands:
+  - `op-env exec [options] -- <command> [args...]` — replace the current process (`os.execvpe`) with `command` running under the resolved environment. A true exec (no lingering parent) matters for stdio JSON-RPC pipes. **Never prints resolved secret values.**
+  - `op-env export [options] [--format env|json]` — print the resolved environment (only the keys the `.env` files introduced) as shell-safe `KEY='value'` lines (for `set -a; eval "$(...)"; set +a`) or a JSON object (for a headers helper). **Prints secret values by design** — only for `eval`/headers consumption, never an interactive terminal or a log.
+  - Loads zero or more `--env-file PATH` files (repeatable, layered — first file to set a key wins; `--override` makes later files win). `--ttl SECONDS` (default 300) and `--no-cache` control the persistent cache; `--require KEY...` hard-fails if a named key is unresolved or empty.
+  - **File-only by default.** The inherited process environment is ignored entirely — not inherited by the child, not an interpolation source. `--inherit-env` takes it along as the base (and interpolation source); `.env` files always override inherited values, so `PATH=${PATH}/extra` extends the inherited `PATH`. `--keep KEY` / `--drop KEY` (repeatable, require `--inherit-env`) allow- and deny-list the inherited variables; the filter is applied **before** the inherited env is used as either base or interpolation source, so a dropped variable can neither be inherited nor smuggled out via `LEAK=${DROPPED}`.
+  - **`${VAR}` / `${VAR:-default}` interpolation** is applied to `.env`-introduced values, once, in a single forward pass, **before** `op://` resolution. References resolve against the inherited environment (only with `--inherit-env`) and earlier values — never an implicit `os.environ`. Resolved `op://` secret values are never themselves interpolated, so a secret containing `${...}` or `$` is passed through verbatim (no mangling, no environment injection from vault content). There is no recursive/fixpoint resolution.
+  - `--ascend` additionally collects `.env` files by walking **up** the directory tree (nearest directory wins). It anchors on each `--env-file`'s directory (or the current directory when none is given) and looks for the basename of each `--env-file` plus any `--env-file-name NAME` (default `.env`). `--ascend-until PATH_OR_NAME` (repeatable) stops the walk at the first matching ancestor — a value with no `/` matches an ancestor directory by name, otherwise it is an exact path; the default boundary is `$HOME`. A hard security ceiling always applies: the walk never enters a world-writable, not-owned, or different-filesystem directory, and symlinked / world-writable / not-owned `.env` files are skipped — since the result feeds `exec`, an attacker who can plant a `.env` in an untrusted ancestor must not be able to inject environment into the child.
+  - Backs resolution with `FileCachingBackend` keyed on a per-invocation cache file. The file name is a hash of the **set** of `op://` references in the composed environment (order-, key-name-, and downstream-argument-independent), so repeated runs resolving the same secrets share one cache file and one authentication, while unrelated invocations stay isolated and never clobber each other.
+
+### Notes
+
+- op-core's base install stays zero-dependency. `op-env` requires the `[cli]` extra (`python-dotenv` for `.env` parsing); `FileCachingBackend` is pure standard library and ships in the base.
+- The intended pattern is that the on-disk `.env` holds **`op://` references, not raw secret values**, so the `.env` itself is safe at rest. op-core resolves the references at launch.
+
 ## [0.3.0] — 2026-05-24
 
 ### Added

@@ -34,6 +34,7 @@ With [`uv`](https://docs.astral.sh/uv/) (recommended):
 ```bash
 uv add "op-core @ git+https://github.com/bedezign/op-core"
 uv add "op-core[sdk] @ git+https://github.com/bedezign/op-core"   # + official 1Password SDK
+uv add "op-core[cli] @ git+https://github.com/bedezign/op-core"   # + the op-env command
 ```
 
 With `pip`:
@@ -41,6 +42,7 @@ With `pip`:
 ```bash
 pip install "op-core @ git+https://github.com/bedezign/op-core"
 pip install "op-core[sdk] @ git+https://github.com/bedezign/op-core"
+pip install "op-core[cli] @ git+https://github.com/bedezign/op-core"
 ```
 
 Pin to a tag for reproducibility:
@@ -49,7 +51,7 @@ Pin to a tag for reproducibility:
 uv add "op-core @ git+https://github.com/bedezign/op-core@v0.1.0"
 ```
 
-Python 3.11+. Zero required dependencies for the base install. The CLI backend requires the `op` binary on `PATH`; the SDK extra installs `onepassword-sdk` from PyPI.
+Python 3.11+. Zero required dependencies for the base install. The CLI backend requires the `op` binary on `PATH`; the `sdk` extra installs `onepassword-sdk` from PyPI; the `cli` extra installs `python-dotenv` and the `op-env` command.
 
 ## Quick tour
 
@@ -135,7 +137,8 @@ def test_post_to_api():
 | `CLIBackend` / `AsyncCLIBackend` | Subprocess (`op` binary) | Desktop or service account | Workstations, CI runners with the CLI installed |
 | `SDKBackend` / `AsyncSDKBackend` | Official `onepassword-sdk` | Service account only | Servers, containers, anywhere without the `op` binary |
 | `InMemoryBackend` / `AsyncInMemoryBackend` | In-process dict + items | None | Tests, persistent local caches, generate/wrap workflows |
-| `CachingBackend` / `AsyncCachingBackend` | Decorator over any backend | Inherits | TTL-bounded read caching with LRU cap and negative caching |
+| `CachingBackend` / `AsyncCachingBackend` | Decorator over any backend | Inherits | In-process TTL read caching with LRU cap and negative caching |
+| `FileCachingBackend` / `AsyncFileCachingBackend` | Decorator over any backend | Inherits | Persistent TTL read cache that survives across process runs; RAM-backed, `0600` |
 
 Backends compose. Cache live reads:
 
@@ -183,6 +186,80 @@ value = op.read(fv.original, online=False)  # raises OpOfflineError if missing
 
 See [`INTEGRATION.md`](INTEGRATION.md) for the full patterns, including item auto-indexing and async equivalents.
 
+## Run a command with resolved secrets (`op-env`)
+
+The `cli` extra ships the `op-env` command. It builds an environment from one or more `.env` files, resolves any `op://` references in it, and then either runs a child process under that environment or prints it. By default it does **not** inherit your shell's environment — the result is exactly your `.env` content, nothing ambient leaks in (opt back in with `--inherit-env`, below).
+
+```bash
+pip install "op-core[cli]"   # installs python-dotenv and the op-env command
+```
+
+Put `op://` **references** in your `.env` — not raw secrets — so the file is safe at rest:
+
+```bash
+# app.env
+DATABASE_URL=op://Personal/App/database_url
+API_TOKEN=op://Personal/App/api_token
+LOG_LEVEL=info
+```
+
+**Run a tool** with the references resolved (a true `exec` — no lingering parent, which matters for stdio JSON-RPC pipes):
+
+```bash
+op-env exec --env-file app.env -- mytool --flag
+```
+
+**Emit the resolved environment** for `eval` or an HTTP-headers helper:
+
+```bash
+set -a; eval "$(op-env export --env-file app.env)"; set +a   # shell-safe KEY='value' lines
+op-env export --env-file app.env --format json               # {"DATABASE_URL": "...", ...}
+```
+
+Multiple `--env-file`s layer in order — by default the **first** file to set a key wins; `--override` flips that so later files win. `--require KEY...` hard-fails if a named key is unresolved or empty.
+
+### Inheriting the shell environment
+
+By default the produced environment is your `.env` content only — a hermetic, fully-specified environment. Pass `--inherit-env` to take your existing environment along as the base (and as an interpolation source, see below). Loaded `.env` files always override inherited values, so this is how you *extend* one:
+
+```bash
+op-env exec --inherit-env --env-file app.env -- mytool
+```
+
+Because inheriting the whole environment can carry unrelated secrets into the child, you can narrow it — applied to the inherited set *before* it's used for anything, so a dropped variable is neither inherited nor available to interpolate:
+
+```bash
+op-env exec --inherit-env --keep PATH --keep HOME -- mytool     # allowlist: only these
+op-env exec --inherit-env --drop AWS_SECRET_ACCESS_KEY -- mytool # denylist: everything but these
+```
+
+`--keep` and `--drop` are repeatable and require `--inherit-env`. If both are given, `--keep` restricts first, then `--drop` subtracts.
+
+### Variable interpolation
+
+Values may reference variables with `${VAR}` or `${VAR:-default}`. Interpolation is applied to the values your `.env` files introduced, once, **before** `op://` references are resolved:
+
+- A `${VAR}` resolves against the inherited environment (only with `--inherit-env`) and any variable set **earlier in the merge order** — and *nothing else*. There is no implicit `os.environ` lookup, so without `--inherit-env`, `${PATH}` resolves to empty.
+- Resolution reads a variable's prior value, so `PATH=${PATH}/extra` extends the inherited `PATH` rather than referring to itself.
+- It is a **single forward pass** — a reference to a variable defined *later* in the merge order, or a cycle, resolves to an empty string. There is no recursive/fixpoint resolution.
+- **Resolved `op://` secret values are never interpolated.** A secret whose value contains `${...}` or `$` is passed to the child verbatim. This is deliberate: it avoids corrupting secrets that contain `$`, and it stops a vault value from injecting environment into the child. Building a string from a resolved secret is your code's job after resolution — op-core is not a template engine.
+- You *can* interpolate into a reference path (`op://${VAULT}/Item/field`), and the cache still keys on the concrete, post-interpolation reference.
+
+**Collect `.env` files up the tree** with `--ascend` — handy for a shared parent `.env` plus a project-specific one:
+
+```bash
+op-env exec --ascend -- mytool          # walk up from the current directory, nearest .env wins
+op-env exec --ascend --env-file app.env -- mytool   # walk up from app.env's directory
+```
+
+`--ascend` walks **up** from each `--env-file`'s directory (or the current directory if none is given), collecting `.env` files with nearest-directory-wins precedence. It looks for the basename of each `--env-file` plus any `--env-file-name NAME` (default `.env`). `--ascend-until PATH_OR_NAME` (repeatable) stops the walk at the first matching ancestor — a bare name matches an ancestor directory by name (`--ascend-until myproject`), anything with a `/` is an exact path; the default boundary is `$HOME`. A security ceiling is always enforced: the walk never enters a world-writable, not-owned, or different-filesystem directory, and symlinked or world-writable `.env` files are skipped — because the result feeds `exec`.
+
+Repeated runs authenticate to 1Password **at most once per TTL window**. `op-env` wraps the auto-detected backend in a [`FileCachingBackend`](#backends) keyed on the set of `op://` references in the environment, so a tool launched over and over reuses the cached values (and, with desktop auth, skips re-triggering the biometric prompt) instead of shelling out to `op` every time. `--ttl SECONDS` (default 300) tunes the window; `--no-cache` disables it.
+
+> **Security:** `op-env exec` never prints resolved secret values. `op-env export` prints them by design — use it only for `eval`/headers consumption, never an interactive terminal or a log. The cache file holds resolved secrets and is written `0600` in a RAM-backed `0700` directory; it is never logged.
+
+Works with both `CLIBackend` (desktop/biometric) and `SDKBackend` (`OP_SERVICE_ACCOUNT_TOKEN`, no prompt) — the backend is auto-detected from the environment.
+
 ## What ships
 
 - Full `op://` URI grammar — quoted segments, URL encoding, self-markers (`.`), `||` fallback chains.
@@ -191,18 +268,18 @@ See [`INTEGRATION.md`](INTEGRATION.md) for the full patterns, including item aut
 - Service-account auth first-class via `ServiceAccountAuth.from_env()` (`OP_SERVICE_ACCOUNT_TOKEN`).
 - Type hints throughout (`py.typed` ships); strict pyright/mypy clean.
 - Sync and async parity — every public class has an async twin.
+- Persistent, cross-process secret caching (`FileCachingBackend`) plus the `op-env` command (`[cli]` extra) for running a child process or exporting an environment with `op://` references resolved.
 
 ## What it deliberately does not ship
 
 - **No template engine.** Field values are references or literals with optional `||` chains — no `{{...}}` substitution, no `${VAR}` interpolation. Consumers that need richer interpolation do it in their own code before calling `op.read()` / `op.resolve()`.
 - **No item CRUD (yet).** `create_item` / `edit_item` / `delete_item` are planned but not landed.
-- **No `run_with_env` subprocess helper (yet).** Resolving `op://` references in environment variables before spawning a child process is on the roadmap.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the full landed surface.
 
 ## Status
 
-`v0.1.0` — alpha. The public API is stable enough to build against; minor breaking changes are possible before `v0.2`. Track [`CHANGELOG.md`](CHANGELOG.md) for what changes between releases.
+`v0.4.0` — pre-1.0. The public API is stable enough to build against; minor breaking changes are possible before `v1.0`. Track [`CHANGELOG.md`](CHANGELOG.md) for what changes between releases.
 
 ## Documentation
 

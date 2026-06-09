@@ -16,6 +16,11 @@ from op_core.backends.base import AsyncBackend, Backend
 from op_core.backends.caching import AsyncCachingBackend, CachingBackend
 from op_core.backends.cli import AsyncCLIBackend, CLIBackend
 from op_core.backends.detect import detect_async_backend, detect_backend
+from op_core.backends.file_caching import (
+    AsyncFileCachingBackend,
+    FileCachingBackend,
+    default_cache_dir,
+)
 from op_core.backends.memory import AsyncInMemoryBackend, InMemoryBackend
 from op_core.backends.sdk import AsyncSDKBackend, SDKBackend
 from op_core.client import AsyncOnePassword, OnePassword
@@ -39,7 +44,7 @@ from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, It
 from op_core.opref import OpRef
 from op_core.strings import expand_braces
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = (  # noqa: RUF022 — semantic grouping intentional
     # Version
@@ -57,6 +62,9 @@ __all__ = (  # noqa: RUF022 — semantic grouping intentional
     "AsyncInMemoryBackend",
     "CachingBackend",
     "AsyncCachingBackend",
+    "FileCachingBackend",
+    "AsyncFileCachingBackend",
+    "default_cache_dir",
     "SDKBackend",
     "AsyncSDKBackend",
     "detect_backend",

@@ -6,9 +6,9 @@ For a high-level overview, see [`README.md`](README.md). For release notes, see 
 
 ## Status
 
-`v0.1.0` — alpha. The API is stable enough to build against, but minor breaking changes are possible before `v0.2`. Specifically:
+`v0.4.0` — pre-1.0. The API is stable enough to build against, but minor breaking changes are possible before `v1.0`. Specifically:
 
-- `run_with_env` (subprocess helper) and Item CRUD are not built. See the README's "What it deliberately does not ship" section.
+- Item CRUD (`create_item` / `edit_item` / `delete_item`) is not built. See the README's "What it deliberately does not ship" section. (The `op-env` subprocess runner and the `FileCachingBackend` persistent cache shipped in 0.4.0.)
 - No template / variable-substitution engine, ever. Field values are full `op://` / `ops://` references or literals, with optional `||` fallback chains. If you need richer interpolation (shell variables, embedded templates, etc.), do it in your own code before calling `op.read()` / `op.resolve()`.
 
 ## Install
@@ -84,6 +84,7 @@ from op_core import (
     SDKBackend, AsyncSDKBackend,                                # SDK backend
     InMemoryBackend, AsyncInMemoryBackend,                      # in-process backend
     CachingBackend, AsyncCachingBackend,                        # decorator
+    FileCachingBackend, AsyncFileCachingBackend, default_cache_dir,  # persistent file cache
     Backend, AsyncBackend,                                      # protocols (for custom backends)
     detect_backend, detect_async_backend,                       # auto-detection
     Auth, ServiceAccountAuth, DesktopAuth, detect_auth,         # auth types
