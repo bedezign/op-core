@@ -293,18 +293,20 @@ def _resolve(
 def _wrap_cache(inner: Backend, composed: Mapping[str, str], *, ttl: int, no_cache: bool) -> Backend:
     if no_cache or ttl <= 0:
         return inner
-    path = _cache_path(composed)
+    path = _cache_path()
     if path is None:
         return inner
-    return FileCachingBackend(inner, ttl=ttl, path=path)
+    return FileCachingBackend(inner, ttl=ttl, path=path, bucket=cache_bucket(composed))
 
 
-def _cache_path(composed: Mapping[str, str]) -> str | None:
+def _cache_path() -> str | None:
+    """Return the shared cache file path; ``None`` disables persistence."""
     try:
-        return str(default_cache_dir() / f"env-{cache_bucket(composed)}.json")
+        directory = default_cache_dir()
     except OSError as exc:
         log.warning("persistent cache unavailable: %s", exc)
         return None
+    return str(directory / "cache.bin")
 
 
 def _do_exec(child: list[str], env: Mapping[str, str], *, exec_fn: ExecFn | None) -> int:

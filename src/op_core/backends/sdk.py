@@ -55,7 +55,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
 
 _INTEGRATION_NAME = "op-core"
-_INTEGRATION_VERSION = "0.4.0"
+_INTEGRATION_VERSION = "0.5.0"
 
 _AUTH_PHRASES = (
     "unauthorized",

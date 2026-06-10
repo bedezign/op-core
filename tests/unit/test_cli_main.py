@@ -549,6 +549,21 @@ class TestCachingWiring:
         run(["export", "--env-file", str(env_file)], backend=second, environ={})
         assert second.read_count == 0  # served from the on-disk cache
 
+    def test_all_runs_share_one_cache_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Different reference sets land as sets in a single cache file, not one file each."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        file_a = tmp_path / "a.env"
+        file_a.write_text("TOKEN=op://V/I/a\n", encoding="utf-8")
+        file_b = tmp_path / "b.env"
+        file_b.write_text("TOKEN=op://V/I/b\n", encoding="utf-8")
+
+        run(["export", "--env-file", str(file_a)], backend=CountingBackend(**{"op://V/I/a": "1"}), environ={})
+        run(["export", "--env-file", str(file_b)], backend=CountingBackend(**{"op://V/I/b": "2"}), environ={})
+
+        cache_dir = tmp_path / "op-core"
+        cache_files = [p for p in cache_dir.iterdir() if not p.name.endswith(".lock")]
+        assert [p.name for p in cache_files] == ["cache.bin"]
+
 
 # ---------------------------------------------------------------------------
 # End-to-end via the real entry point (plain values, no 1Password needed)

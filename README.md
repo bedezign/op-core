@@ -48,7 +48,7 @@ pip install "op-core[cli] @ git+https://github.com/bedezign/op-core"
 Pin to a tag for reproducibility:
 
 ```bash
-uv add "op-core @ git+https://github.com/bedezign/op-core@v0.1.0"
+uv add "op-core @ git+https://github.com/bedezign/op-core@v0.4.0"
 ```
 
 Python 3.11+. Zero required dependencies for the base install. The CLI backend requires the `op` binary on `PATH`; the `sdk` extra installs `onepassword-sdk` from PyPI; the `cli` extra installs `python-dotenv` and the `op-env` command.
@@ -138,7 +138,7 @@ def test_post_to_api():
 | `SDKBackend` / `AsyncSDKBackend` | Official `onepassword-sdk` | Service account only | Servers, containers, anywhere without the `op` binary |
 | `InMemoryBackend` / `AsyncInMemoryBackend` | In-process dict + items | None | Tests, persistent local caches, generate/wrap workflows |
 | `CachingBackend` / `AsyncCachingBackend` | Decorator over any backend | Inherits | In-process TTL read caching with LRU cap and negative caching |
-| `FileCachingBackend` / `AsyncFileCachingBackend` | Decorator over any backend | Inherits | Persistent TTL read cache that survives across process runs; RAM-backed, `0600` |
+| `FileCachingBackend` / `AsyncFileCachingBackend` | Decorator over any backend | Inherits | Persistent TTL read cache that survives across process runs; scrambled, RAM-backed, `0600` |
 
 Backends compose. Cache live reads:
 
@@ -256,7 +256,7 @@ op-env exec --ascend --env-file app.env -- mytool   # walk up from app.env's dir
 
 Repeated runs authenticate to 1Password **at most once per TTL window**. `op-env` wraps the auto-detected backend in a [`FileCachingBackend`](#backends) keyed on the set of `op://` references in the environment, so a tool launched over and over reuses the cached values (and, with desktop auth, skips re-triggering the biometric prompt) instead of shelling out to `op` every time. `--ttl SECONDS` (default 300) tunes the window; `--no-cache` disables it.
 
-> **Security:** `op-env exec` never prints resolved secret values. `op-env export` prints them by design — use it only for `eval`/headers consumption, never an interactive terminal or a log. The cache file holds resolved secrets and is written `0600` in a RAM-backed `0700` directory; it is never logged.
+> **Security:** `op-env exec` never prints resolved secret values. `op-env export` prints them by design — use it only for `eval`/headers consumption, never an interactive terminal or a log. The cache file holds resolved secrets and is written `0600` in a RAM-backed `0700` directory, scrambled with a machine-local key so values never hit the filesystem as readable text; it is never logged.
 
 Works with both `CLIBackend` (desktop/biometric) and `SDKBackend` (`OP_SERVICE_ACCOUNT_TOKEN`, no prompt) — the backend is auto-detected from the environment.
 
@@ -279,7 +279,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the full landed surface.
 
 ## Status
 
-`v0.4.0` — pre-1.0. The public API is stable enough to build against; minor breaking changes are possible before `v1.0`. Track [`CHANGELOG.md`](CHANGELOG.md) for what changes between releases.
+`v0.5.0` — pre-1.0. The public API is stable enough to build against; minor breaking changes are possible before `v1.0`. Track [`CHANGELOG.md`](CHANGELOG.md) for what changes between releases.
 
 ## Documentation
 

@@ -5,6 +5,17 @@ All notable changes to op-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-06-10
+
+### Changed
+
+- **`FileCachingBackend` / `AsyncFileCachingBackend` storage reworked** — all processes now share a single scrambled cache file (`cache.bin`) holding one **set** of entries per caching context, instead of one plaintext JSON file per reference set:
+  - **Sets, keyed by `bucket`.** Both backends take a `bucket` id naming their set (`op-env` passes a hash of the composed environment's `op://` reference set, as before). The same credential cached under two sets is two independent entries — deliberate TTL isolation per context.
+  - **Writer-owned per-set TTL.** The TTL a backend is constructed with is stamped into its set and obeyed by every later reader, so a reader can never keep a value beyond the writer's intention. A backend whose constructed TTL differs from its stored set's discards and rebuilds the set — a different TTL means the cache is reconstructed, never reinterpreted.
+  - **Purge-on-load.** Every load walks *all* sets, drops entries expired by their own set's TTL (and sets left empty), and rewrites the file if anything was dropped — so any invocation scrubs everyone's stale values, not just its own.
+  - **Locked merge-on-persist.** Writes re-read the file under an exclusive `flock` (sidecar `.lock` file) and merge newest-wins, so concurrent runs can neither clobber each other's sets nor resurrect just-purged entries.
+  - **Scrambled at rest.** The payload is zlib-compressed and XOR-ed with a SHA-256 keystream derived from machine-local material (machine-id + uid) and a per-write random nonce, so resolved secrets never hit the filesystem as readable text and the file is useless copied off the machine. This is obfuscation, not encryption — it defeats casual reading, grep, secret scanners, and offline copies, not a same-user process. The existing protections (`0600` file in `0700` dir, ownership/symlink checks, atomic writes, degrade-to-inner-backend on corruption) are unchanged.
+
 ## [0.4.0] — 2026-06-09
 
 ### Added

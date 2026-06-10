@@ -6,7 +6,7 @@ For a high-level overview, see [`README.md`](README.md). For release notes, see 
 
 ## Status
 
-`v0.4.0` — pre-1.0. The API is stable enough to build against, but minor breaking changes are possible before `v1.0`. Specifically:
+`v0.5.0` — pre-1.0. The API is stable enough to build against, but minor breaking changes are possible before `v1.0`. Specifically:
 
 - Item CRUD (`create_item` / `edit_item` / `delete_item`) is not built. See the README's "What it deliberately does not ship" section. (The `op-env` subprocess runner and the `FileCachingBackend` persistent cache shipped in 0.4.0.)
 - No template / variable-substitution engine, ever. Field values are full `op://` / `ops://` references or literals, with optional `||` fallback chains. If you need richer interpolation (shell variables, embedded templates, etc.), do it in your own code before calling `op.read()` / `op.resolve()`.
@@ -34,8 +34,8 @@ pip install "op-core[sdk] @ git+https://github.com/bedezign/op-core"
 Pin to a tag for reproducibility:
 
 ```bash
-uv add "op-core @ git+https://github.com/bedezign/op-core@v0.1.0"
-pip install "op-core @ git+https://github.com/bedezign/op-core@v0.1.0"
+uv add "op-core @ git+https://github.com/bedezign/op-core@v0.4.0"
+pip install "op-core @ git+https://github.com/bedezign/op-core@v0.4.0"
 ```
 
 In `pyproject.toml`, the equivalent is:
@@ -43,7 +43,7 @@ In `pyproject.toml`, the equivalent is:
 ```toml
 [project]
 dependencies = [
-    "op-core @ git+https://github.com/bedezign/op-core@v0.1.0",
+    "op-core @ git+https://github.com/bedezign/op-core@v0.4.0",
 ]
 ```
 
@@ -54,7 +54,7 @@ Or, with `uv`'s `[tool.uv.sources]` syntax:
 dependencies = ["op-core"]
 
 [tool.uv.sources]
-op-core = { git = "https://github.com/bedezign/op-core", tag = "v0.1.0" }
+op-core = { git = "https://github.com/bedezign/op-core", tag = "v0.4.0" }
 ```
 
 Python 3.11+. The CLI backend requires the `op` binary on `PATH`. The SDK extra installs `onepassword-sdk` from PyPI.
