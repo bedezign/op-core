@@ -6,6 +6,11 @@ in-process via :func:`op_core.cli.main.run` with an injected
 ``os.execvpe`` would replace the test process). Two end-to-end tests drive the
 real ``python -m op_core.cli`` entry point with plain (non-secret) values to
 prove the exec and export paths work for real.
+
+Caching semantics (design 5.3):
+- Default (no ``--ttl``, or ``--ttl 0``): bare backend, no disk writes.
+- ``--ttl N`` with N>0: one-writer ``ResolverStack`` over ``FileWriterLayer``.
+- ``--no-cache`` is an unknown flag; argparse exits non-zero.
 """
 
 from __future__ import annotations
@@ -50,7 +55,7 @@ class TestExec:
         env_file.write_text("TOKEN=op://V/I/tok\n", encoding="utf-8")
         rec = ExecRecorder()
         code = run(
-            ["exec", "--env-file", str(env_file), "--no-cache", "--", "mytool", "--flag"],
+            ["exec", "--env-file", str(env_file), "--", "mytool", "--flag"],
             backend=_backend(**{"op://V/I/tok": "s3cr3t"}),
             environ={},
             exec_fn=rec,
@@ -62,7 +67,7 @@ class TestExec:
     def test_child_argv_passed_through(self, tmp_path: Path) -> None:
         rec = ExecRecorder()
         run(
-            ["exec", "--no-cache", "--", "mytool", "--flag", "pos"],
+            ["exec", "--", "mytool", "--flag", "pos"],
             backend=_backend(),
             environ={},
             exec_fn=rec,
@@ -73,7 +78,7 @@ class TestExec:
     def test_inherited_env_excluded_by_default(self) -> None:
         rec = ExecRecorder()
         run(
-            ["exec", "--no-cache", "--", "tool"],
+            ["exec", "--", "tool"],
             backend=_backend(),
             environ={"EXISTING": "value"},
             exec_fn=rec,
@@ -83,7 +88,7 @@ class TestExec:
     def test_env_inherited_with_flag(self) -> None:
         rec = ExecRecorder()
         run(
-            ["exec", "--inherit-env", "--no-cache", "--", "tool"],
+            ["exec", "--inherit-env", "--", "tool"],
             backend=_backend(),
             environ={"EXISTING": "value"},
             exec_fn=rec,
@@ -95,7 +100,7 @@ class TestExec:
         env_file = tmp_path / "app.env"
         env_file.write_text("TOKEN=op://V/I/tok\n", encoding="utf-8")
         run(
-            ["exec", "--env-file", str(env_file), "--no-cache", "--", "tool"],
+            ["exec", "--env-file", str(env_file), "--", "tool"],
             backend=_backend(**{"op://V/I/tok": "TOP-SECRET"}),
             environ={},
             exec_fn=ExecRecorder(),
@@ -105,7 +110,7 @@ class TestExec:
         assert "TOP-SECRET" not in captured.err
 
     def test_missing_command_after_dash_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
-        code = run(["exec", "--no-cache", "--"], backend=_backend(), environ={})
+        code = run(["exec", "--"], backend=_backend(), environ={})
         assert code == 2
         assert "exec requires a command" in capsys.readouterr().err
 
@@ -114,7 +119,7 @@ class TestExec:
         env_file.write_text("TOKEN=op://V/I/missing\n", encoding="utf-8")
         rec = ExecRecorder()
         code = run(
-            ["exec", "--env-file", str(env_file), "--no-cache", "--", "tool"],
+            ["exec", "--env-file", str(env_file), "--", "tool"],
             backend=_backend(),
             environ={},
             exec_fn=rec,
@@ -134,7 +139,7 @@ class TestExport:
         env_file = tmp_path / "app.env"
         env_file.write_text("TOKEN=op://V/I/tok\nHOST=localhost\n", encoding="utf-8")
         code = run(
-            ["export", "--env-file", str(env_file), "--no-cache"],
+            ["export", "--env-file", str(env_file)],
             backend=_backend(**{"op://V/I/tok": "abc"}),
             environ={},
         )
@@ -147,7 +152,7 @@ class TestExport:
         env_file = tmp_path / "app.env"
         env_file.write_text("TOKEN=op://V/I/tok\n", encoding="utf-8")
         run(
-            ["export", "--env-file", str(env_file), "--no-cache", "--format", "json"],
+            ["export", "--env-file", str(env_file), "--format", "json"],
             backend=_backend(**{"op://V/I/tok": "abc"}),
             environ={},
         )
@@ -157,7 +162,7 @@ class TestExport:
         env_file = tmp_path / "app.env"
         env_file.write_text("APP_KEY=value\n", encoding="utf-8")
         run(
-            ["export", "--env-file", str(env_file), "--no-cache", "--format", "json"],
+            ["export", "--env-file", str(env_file), "--format", "json"],
             backend=_backend(),
             environ={"UNRELATED": "should-not-appear", "PATH": "/usr/bin"},
         )
@@ -165,7 +170,7 @@ class TestExport:
         assert emitted == {"APP_KEY": "value"}
 
     def test_export_rejects_trailing_command(self, capsys: pytest.CaptureFixture[str]) -> None:
-        code = run(["export", "--no-cache", "--", "oops"], backend=_backend(), environ={})
+        code = run(["export", "--", "oops"], backend=_backend(), environ={})
         assert code == 2
         assert "export does not take a command" in capsys.readouterr().err
 
@@ -181,7 +186,7 @@ class TestErrorSurfacing:
             raise FileNotFoundError(f"no such file: {file}")
 
         code = run(
-            ["exec", "--no-cache", "--", "nonexistent-xyz"],
+            ["exec", "--", "nonexistent-xyz"],
             backend=_backend(),
             environ={},
             exec_fn=boom,
@@ -199,7 +204,7 @@ class TestErrorSurfacing:
         env_file = tmp_path / "app.env"
         env_file.write_text("TOKEN=op://V/I/tok\n", encoding="utf-8")
         code = run(
-            ["export", "--env-file", str(env_file), "--no-cache"],
+            ["export", "--env-file", str(env_file)],
             backend=FailingBackend(),
             environ={},
         )
@@ -217,7 +222,7 @@ class TestComposition:
         env_file = tmp_path / "app.env"
         env_file.write_text("SHARED=from-file\n", encoding="utf-8")
         run(
-            ["export", "--inherit-env", "--env-file", str(env_file), "--no-cache", "--format", "json"],
+            ["export", "--inherit-env", "--env-file", str(env_file), "--format", "json"],
             backend=_backend(),
             environ={"SHARED": "from-proc"},
         )
@@ -227,7 +232,7 @@ class TestComposition:
         env_file = tmp_path / "app.env"
         env_file.write_text("SHARED=from-file\n", encoding="utf-8")
         run(
-            ["export", "--env-file", str(env_file), "--no-cache", "--format", "json"],
+            ["export", "--env-file", str(env_file), "--format", "json"],
             backend=_backend(),
             environ={"SHARED": "from-proc", "OTHER": "ambient"},
         )
@@ -247,7 +252,6 @@ class TestComposition:
                 "--env-file",
                 str(tool),
                 "--override",
-                "--no-cache",
                 "--format",
                 "json",
             ],
@@ -261,7 +265,7 @@ class TestComposition:
         env_file = tmp_path / "app.env"
         env_file.write_text("PRESENT=x\n", encoding="utf-8")
         code = run(
-            ["export", "--env-file", str(env_file), "--no-cache", "--require", "ABSENT"],
+            ["export", "--env-file", str(env_file), "--require", "ABSENT"],
             backend=_backend(),
             environ={},
         )
@@ -272,7 +276,7 @@ class TestComposition:
         env_file = tmp_path / "app.env"
         env_file.write_text("PRESENT=x\n", encoding="utf-8")
         code = run(
-            ["export", "--env-file", str(env_file), "--no-cache", "--require", "PRESENT"],
+            ["export", "--env-file", str(env_file), "--require", "PRESENT"],
             backend=_backend(),
             environ={},
         )
@@ -284,7 +288,7 @@ class TestComposition:
         env_file.write_text("PLAIN=value\n", encoding="utf-8")
         rec = ExecRecorder()
         code = run(
-            ["exec", "--env-file", str(env_file), "--no-cache", "--", "tool"],
+            ["exec", "--env-file", str(env_file), "--", "tool"],
             environ={},
             exec_fn=rec,
         )
@@ -294,7 +298,7 @@ class TestComposition:
 
     def test_bad_env_file_fails_loudly(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         code = run(
-            ["export", "--env-file", str(tmp_path / "nonexistent.env"), "--no-cache"],
+            ["export", "--env-file", str(tmp_path / "nonexistent.env")],
             backend=_backend(),
             environ={},
         )
@@ -316,7 +320,7 @@ class TestInterpolation:
         env_file = tmp_path / "app.env"
         env_file.write_text("VENV=${RUNTIME_DIR}/python\n", encoding="utf-8")
         run(
-            ["export", "--env-file", str(env_file), "--no-cache", "--format", "json"],
+            ["export", "--env-file", str(env_file), "--format", "json"],
             backend=_backend(),
             environ={},
         )
@@ -326,7 +330,7 @@ class TestInterpolation:
         env_file = tmp_path / "app.env"
         env_file.write_text("VENV=${RUNTIME_DIR}/python\n", encoding="utf-8")
         run(
-            ["export", "--inherit-env", "--env-file", str(env_file), "--no-cache", "--format", "json"],
+            ["export", "--inherit-env", "--env-file", str(env_file), "--format", "json"],
             backend=_backend(),
             environ={"RUNTIME_DIR": "/opt/run"},
         )
@@ -336,7 +340,7 @@ class TestInterpolation:
         env_file = tmp_path / "app.env"
         env_file.write_text("PATH=${PATH}/extra\n", encoding="utf-8")
         run(
-            ["export", "--inherit-env", "--env-file", str(env_file), "--no-cache", "--format", "json"],
+            ["export", "--inherit-env", "--env-file", str(env_file), "--format", "json"],
             backend=_backend(),
             environ={"PATH": "/usr/bin:/bin"},
         )
@@ -348,7 +352,7 @@ class TestInterpolation:
         tool = tmp_path / "tool.env"
         tool.write_text("LOG=${BASE}/logs\n", encoding="utf-8")
         run(
-            ["export", "--env-file", str(defaults), "--env-file", str(tool), "--no-cache", "--format", "json"],
+            ["export", "--env-file", str(defaults), "--env-file", str(tool), "--format", "json"],
             backend=_backend(),
             environ={},
         )
@@ -358,7 +362,7 @@ class TestInterpolation:
         env_file = tmp_path / "app.env"
         env_file.write_text("TOKEN=op://${VAULT}/Item/tok\n", encoding="utf-8")
         run(
-            ["export", "--inherit-env", "--env-file", str(env_file), "--no-cache", "--format", "json"],
+            ["export", "--inherit-env", "--env-file", str(env_file), "--format", "json"],
             backend=_backend(**{"op://Personal/Item/tok": "secret"}),
             environ={"VAULT": "Personal"},
         )
@@ -372,7 +376,7 @@ class TestInterpolation:
         env_file = tmp_path / "app.env"
         env_file.write_text("PW=op://V/I/pw\n", encoding="utf-8")
         run(
-            ["export", "--inherit-env", "--env-file", str(env_file), "--no-cache", "--format", "json"],
+            ["export", "--inherit-env", "--env-file", str(env_file), "--format", "json"],
             backend=_backend(**{"op://V/I/pw": "pa$$w0rd${HOME}"}),
             environ={"HOME": "/home/x"},
         )
@@ -388,7 +392,7 @@ class TestInheritFilter:
     def test_keep_allowlist(self, capsys: pytest.CaptureFixture[str]) -> None:
         rec = ExecRecorder()
         run(
-            ["exec", "--inherit-env", "--keep", "PATH", "--no-cache", "--", "tool"],
+            ["exec", "--inherit-env", "--keep", "PATH", "--", "tool"],
             backend=_backend(),
             environ={"PATH": "/bin", "SECRET": "x"},
             exec_fn=rec,
@@ -398,7 +402,7 @@ class TestInheritFilter:
     def test_drop_denylist(self, capsys: pytest.CaptureFixture[str]) -> None:
         rec = ExecRecorder()
         run(
-            ["exec", "--inherit-env", "--drop", "SECRET", "--no-cache", "--", "tool"],
+            ["exec", "--inherit-env", "--drop", "SECRET", "--", "tool"],
             backend=_backend(),
             environ={"PATH": "/bin", "SECRET": "x"},
             exec_fn=rec,
@@ -408,7 +412,7 @@ class TestInheritFilter:
     def test_keep_then_drop(self, capsys: pytest.CaptureFixture[str]) -> None:
         rec = ExecRecorder()
         run(
-            ["exec", "--inherit-env", "--keep", "A", "--keep", "B", "--drop", "B", "--no-cache", "--", "tool"],
+            ["exec", "--inherit-env", "--keep", "A", "--keep", "B", "--drop", "B", "--", "tool"],
             backend=_backend(),
             environ={"A": "1", "B": "2", "C": "3"},
             exec_fn=rec,
@@ -430,7 +434,6 @@ class TestInheritFilter:
                 "AWS_KEY",
                 "--env-file",
                 str(env_file),
-                "--no-cache",
                 "--format",
                 "json",
             ],
@@ -452,7 +455,6 @@ class TestInheritFilter:
                 "PATH",
                 "--env-file",
                 str(env_file),
-                "--no-cache",
                 "--format",
                 "json",
             ],
@@ -464,12 +466,12 @@ class TestInheritFilter:
         assert "supersecret" not in out
 
     def test_keep_without_inherit_env_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
-        code = run(["export", "--keep", "PATH", "--no-cache"], backend=_backend(), environ={})
+        code = run(["export", "--keep", "PATH"], backend=_backend(), environ={})
         assert code == 2
         assert "require --inherit-env" in capsys.readouterr().err
 
     def test_drop_without_inherit_env_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
-        code = run(["export", "--drop", "SECRET", "--no-cache"], backend=_backend(), environ={})
+        code = run(["export", "--drop", "SECRET"], backend=_backend(), environ={})
         assert code == 2
         assert "require --inherit-env" in capsys.readouterr().err
 
@@ -490,7 +492,7 @@ class TestAscend:
         (home / "proj" / "sub" / ".env").write_text("FROM_SUB=s\n", encoding="utf-8")
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.chdir(home / "proj" / "sub")
-        run(["export", "--ascend", "--no-cache", "--format", "json"], backend=_backend(), environ={})
+        run(["export", "--ascend", "--format", "json"], backend=_backend(), environ={})
         assert json.loads(capsys.readouterr().out) == {
             "FROM_HOME": "h",
             "FROM_PROJ": "p",
@@ -506,16 +508,16 @@ class TestAscend:
         (home / "sub" / ".env").write_text("SHARED=near\n", encoding="utf-8")
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.chdir(home / "sub")
-        run(["export", "--ascend", "--no-cache", "--format", "json"], backend=_backend(), environ={})
+        run(["export", "--ascend", "--format", "json"], backend=_backend(), environ={})
         assert json.loads(capsys.readouterr().out)["SHARED"] == "near"
 
     def test_ascend_until_without_ascend_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
-        code = run(["export", "--ascend-until", "/tmp", "--no-cache"], backend=_backend(), environ={})
+        code = run(["export", "--ascend-until", "/tmp"], backend=_backend(), environ={})
         assert code == 2
         assert "require --ascend" in capsys.readouterr().err
 
     def test_env_file_name_without_ascend_errors(self, capsys: pytest.CaptureFixture[str]) -> None:
-        code = run(["export", "--env-file-name", ".env", "--no-cache"], backend=_backend(), environ={})
+        code = run(["export", "--env-file-name", ".env"], backend=_backend(), environ={})
         assert code == 2
         assert "require --ascend" in capsys.readouterr().err
 
@@ -536,7 +538,21 @@ class CountingBackend(InMemoryBackend):
 
 
 class TestCachingWiring:
-    def test_second_run_uses_cache(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # --- default (ttl=0): no caching ---
+
+    def test_default_no_cache_file_created(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Design 5.3: ttl=0 (the default) returns the bare backend; no cache file is written."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        env_file = tmp_path / "app.env"
+        env_file.write_text("TOKEN=op://V/I/tok\n", encoding="utf-8")
+
+        run(["export", "--env-file", str(env_file)], backend=CountingBackend(**{"op://V/I/tok": "s"}), environ={})
+
+        cache_dir = tmp_path / "op-core"
+        assert not cache_dir.exists(), "No cache directory should be created when ttl=0"
+
+    def test_default_second_run_re_resolves(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Design 5.3: without --ttl, every run resolves through the backend (no persistence)."""
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
         env_file = tmp_path / "app.env"
         env_file.write_text("TOKEN=op://V/I/tok\n", encoding="utf-8")
@@ -547,9 +563,40 @@ class TestCachingWiring:
 
         second = CountingBackend(**{"op://V/I/tok": "secret"})
         run(["export", "--env-file", str(env_file)], backend=second, environ={})
+        assert second.read_count == 1  # re-resolved — no cache in the default
+
+    def test_explicit_ttl_zero_no_cache_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Design 5.3: --ttl 0 is the same as the default — bare backend, no disk writes."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        env_file = tmp_path / "app.env"
+        env_file.write_text("TOKEN=op://V/I/tok\n", encoding="utf-8")
+
+        run(
+            ["export", "--ttl", "0", "--env-file", str(env_file)],
+            backend=CountingBackend(**{"op://V/I/tok": "s"}),
+            environ={},
+        )
+
+        cache_dir = tmp_path / "op-core"
+        assert not cache_dir.exists(), "No cache directory should be created when --ttl 0"
+
+    # --- --ttl N>0: one-writer ResolverStack ---
+
+    def test_ttl_positive_second_run_uses_cache(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Design 5.3: --ttl N>0 builds a one-writer ResolverStack; second run is served from disk."""
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        env_file = tmp_path / "app.env"
+        env_file.write_text("TOKEN=op://V/I/tok\n", encoding="utf-8")
+
+        first = CountingBackend(**{"op://V/I/tok": "secret"})
+        run(["export", "--ttl", "300", "--env-file", str(env_file)], backend=first, environ={})
+        assert first.read_count == 1
+
+        second = CountingBackend(**{"op://V/I/tok": "secret"})
+        run(["export", "--ttl", "300", "--env-file", str(env_file)], backend=second, environ={})
         assert second.read_count == 0  # served from the on-disk cache
 
-    def test_all_runs_share_one_cache_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_ttl_positive_all_runs_share_one_cache_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Different reference sets land as sets in a single cache file, not one file each."""
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
         file_a = tmp_path / "a.env"
@@ -557,12 +604,28 @@ class TestCachingWiring:
         file_b = tmp_path / "b.env"
         file_b.write_text("TOKEN=op://V/I/b\n", encoding="utf-8")
 
-        run(["export", "--env-file", str(file_a)], backend=CountingBackend(**{"op://V/I/a": "1"}), environ={})
-        run(["export", "--env-file", str(file_b)], backend=CountingBackend(**{"op://V/I/b": "2"}), environ={})
+        run(
+            ["export", "--ttl", "300", "--env-file", str(file_a)],
+            backend=CountingBackend(**{"op://V/I/a": "1"}),
+            environ={},
+        )
+        run(
+            ["export", "--ttl", "300", "--env-file", str(file_b)],
+            backend=CountingBackend(**{"op://V/I/b": "2"}),
+            environ={},
+        )
 
         cache_dir = tmp_path / "op-core"
         cache_files = [p for p in cache_dir.iterdir() if not p.name.endswith(".lock")]
         assert [p.name for p in cache_files] == ["cache.bin"]
+
+    # --- --no-cache is an unknown flag ---
+
+    def test_no_cache_flag_is_unknown(self) -> None:
+        """Design 9.4: --no-cache is removed outright; passing it is an argparse unknown-flag error."""
+        with pytest.raises(SystemExit) as exc_info:
+            run(["export", "--no-cache"], backend=_backend(), environ={})
+        assert exc_info.value.code != 0
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +651,6 @@ class TestEndToEnd:
                 "exec",
                 "--env-file",
                 str(env_file),
-                "--no-cache",
                 "--",
                 sys.executable,
                 "-c",
@@ -601,14 +663,14 @@ class TestEndToEnd:
     def test_export_json_via_real_entrypoint(self, tmp_path: Path) -> None:
         env_file = tmp_path / "plain.env"
         env_file.write_text("A=1\nB=two\n", encoding="utf-8")
-        result = _run_module(["export", "--env-file", str(env_file), "--no-cache", "--format", "json"])
+        result = _run_module(["export", "--env-file", str(env_file), "--format", "json"])
         assert result.returncode == 0
         assert json.loads(result.stdout) == {"A": "1", "B": "two"}
 
     def test_export_env_round_trips_through_eval(self, tmp_path: Path) -> None:
         env_file = tmp_path / "plain.env"
         env_file.write_text("MSG=hi there\n", encoding="utf-8")
-        export = _run_module(["export", "--env-file", str(env_file), "--no-cache"])
+        export = _run_module(["export", "--env-file", str(env_file)])
         assert export.returncode == 0
         evaled = subprocess.run(
             ["bash", "-c", 'set -a; eval "$1"; set +a; printf "%s" "$MSG"', "_", export.stdout],
@@ -620,4 +682,11 @@ class TestEndToEnd:
 
     def test_no_subcommand_errors(self) -> None:
         result = _run_module([])
+        assert result.returncode != 0
+
+    def test_no_cache_flag_fails_via_real_entrypoint(self, tmp_path: Path) -> None:
+        """Design 9.4: --no-cache must be an unknown-flag error at the CLI level."""
+        env_file = tmp_path / "plain.env"
+        env_file.write_text("A=1\n", encoding="utf-8")
+        result = _run_module(["export", "--env-file", str(env_file), "--no-cache"])
         assert result.returncode != 0

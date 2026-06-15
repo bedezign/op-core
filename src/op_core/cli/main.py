@@ -13,9 +13,12 @@ do something with it):
   values by design** — only for ``eval``/headers consumption, never an
   interactive terminal or a log.
 
-Repeated runs resolving the same secrets share a per-invocation
-:class:`~op_core.backends.file_caching.FileCachingBackend` cache file, so they
-authenticate to 1Password at most once per TTL window.
+Caching is strictly opt-in: pass ``--ttl N`` (N > 0) to enable it. With a
+positive ``--ttl``, repeated runs resolving the same secrets share a
+one-writer :class:`~op_core.backends.stack.ResolverStack` over a
+:class:`~op_core.backends.file_caching.FileWriterLayer` cache file, so they
+authenticate to 1Password at most once per TTL window. Without ``--ttl``,
+every run resolves through 1Password.
 """
 
 from __future__ import annotations
@@ -29,7 +32,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from op_core.backends.detect import detect_backend
-from op_core.backends.file_caching import FileCachingBackend, default_cache_dir
+from op_core.backends.file_caching import FileWriterLayer, default_cache_dir
+from op_core.backends.stack import ResolverStack
 from op_core.cli.compose import (
     cache_bucket,
     check_required,
@@ -132,14 +136,9 @@ def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--ttl",
         type=int,
-        default=300,
+        default=0,
         metavar="SECONDS",
-        help="cache resolved values for this long across runs (default: 300; 0 disables)",
-    )
-    parser.add_argument(
-        "--no-cache",
-        action="store_true",
-        help="do not read or write the persistent cache",
+        help="cache resolved values for this long across runs (default: 0, caching off; positive N enables it)",
     )
     parser.add_argument(
         "--require",
@@ -267,7 +266,7 @@ def _dispatch(
     _validate_flags(ns, child)
 
     _parent, introduced, composed = _build_composed_env(ns, environ)
-    resolved = _resolve(composed, ttl=ns.ttl, no_cache=ns.no_cache, backend=backend)
+    resolved = _resolve(composed, ttl=ns.ttl, backend=backend)
     check_required(resolved, ns.require or [])
 
     if ns.command == "exec":
@@ -279,24 +278,24 @@ def _resolve(
     composed: Mapping[str, str],
     *,
     ttl: int,
-    no_cache: bool,
     backend: Backend | None,
 ) -> dict[str, str]:
     # No references means no backend (and no 1Password contact) is needed at all.
     if not any(is_op_reference(value) for value in composed.values()):
         return dict(composed)
     inner = backend if backend is not None else detect_backend()
-    op = OnePassword(_wrap_cache(inner, composed, ttl=ttl, no_cache=no_cache))
+    op = OnePassword(_wrap_cache(inner, composed, ttl=ttl))
     return resolve_env(composed, op)
 
 
-def _wrap_cache(inner: Backend, composed: Mapping[str, str], *, ttl: int, no_cache: bool) -> Backend:
-    if no_cache or ttl <= 0:
-        return inner
+def _wrap_cache(inner: Backend, composed: Mapping[str, str], *, ttl: int) -> Backend:
+    if ttl <= 0:
+        return inner  # caching off — the default
     path = _cache_path()
     if path is None:
-        return inner
-    return FileCachingBackend(inner, ttl=ttl, path=path, bucket=cache_bucket(composed))
+        return inner  # cache location cannot be secured -> run without caching
+    layer = FileWriterLayer(ttl=ttl, path=path, bucket=cache_bucket(composed))
+    return ResolverStack(layers=[layer], source=inner)
 
 
 def _cache_path() -> str | None:

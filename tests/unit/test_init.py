@@ -8,6 +8,8 @@ to update the package root.
 
 from __future__ import annotations
 
+import pytest
+
 import op_core
 
 
@@ -49,3 +51,48 @@ class TestFlatExportIdentity:
 
         assert TEMPLATE_OPEN == "{{"
         assert TEMPLATE_CLOSE == "}}"
+
+
+class TestResolverStackExports:
+    def test_new_names_resolve_from_root(self) -> None:
+        from op_core import (
+            AsyncResolverStack,
+            FileReaderLayer,
+            FileWriterLayer,
+            MemoryLayer,
+            ResolverStack,
+            clear_cache_file,
+        )
+        from op_core.backends import file_caching, stack
+
+        assert ResolverStack is stack.ResolverStack
+        assert AsyncResolverStack is stack.AsyncResolverStack
+        assert MemoryLayer is stack.MemoryLayer
+        assert FileReaderLayer is file_caching.FileReaderLayer
+        assert FileWriterLayer is file_caching.FileWriterLayer
+        assert clear_cache_file is file_caching.clear_cache_file
+
+
+REMOVED_NAMES = (
+    "CachingBackend",
+    "AsyncCachingBackend",
+    "FileCachingBackend",
+    "AsyncFileCachingBackend",
+    "CacheFile",
+    "FileCacheReaderBackend",
+    "AsyncFileCacheReaderBackend",
+)
+
+
+class TestRemovedNames:
+    def test_removed_names_not_exported(self) -> None:
+        for name in REMOVED_NAMES:
+            assert not hasattr(op_core, name), f"{name} should be removed from op_core"
+            assert name not in op_core.__all__
+
+    @pytest.mark.parametrize("name", REMOVED_NAMES)
+    def test_removed_name_import_raises(self, name: str) -> None:
+        # The documented clean-break contract: ``from op_core import <decorator>``
+        # fails loudly at import time (design 9.1), not as a silent no-op.
+        with pytest.raises(ImportError):
+            exec(f"from op_core import {name}", {})  # exercises the import-statement form

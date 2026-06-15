@@ -1,6 +1,6 @@
 [project]
 name = "op-core"
-version = "0.5.0"
+version = "0.6.0"
 description = "Backend-agnostic Python toolkit for 1Password: op:// resolution, sync/async API, swappable backends for CLI, SDK, and tests."
 readme = "README.md"
 license = "Apache-2.0"
@@ -32,6 +32,7 @@ cli = ["python-dotenv>=1.0"]
 
 [project.scripts]
 op-env = "op_core.cli.main:main"
+op-cache = "op_core.cli.cache:main"
 
 [dependency-groups]
 dev = [

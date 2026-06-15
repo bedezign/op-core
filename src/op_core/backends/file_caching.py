@@ -1,65 +1,58 @@
-"""Persistent caching decorator backends.
+"""File-backed cache engine and layers.
 
-:class:`FileCachingBackend` and :class:`AsyncFileCachingBackend` mirror
-:class:`~op_core.backends.caching.CachingBackend`, but persist resolved
-``read()`` results to a file so cache hits survive *across separate process
-invocations*. The motivating case is a short-lived CLI launched repeatedly: the
-in-process :class:`CachingBackend` does nothing for it (its store dies with the
-process), so every run re-shells to ``op`` and, with desktop auth, re-triggers
-the biometric prompt. A persisted reference->value map lets repeated runs
-authenticate at most once per TTL window.
+This module provides the persistent half of the resolver stack: a scrambled,
+single-file, multi-set cache shared by all processes on the machine, plus the
+two layer types that front it.
 
-Key differences from the in-process backend:
+* :class:`FileReaderLayer` -- a read-only observer of one named set. It loads a
+  consistent snapshot once at construction (lock-free; atomic writes make that
+  safe), serves entries while they are live by the set's *stored* TTL, and never
+  touches the filesystem afterwards: no entries added, no misses recorded, no
+  purge rewrite, no lock sidecar, no corrupt-file scrub. It degrades to "no
+  entries" when the file is missing, corrupt, untrusted, or holds no such set.
+* :class:`FileWriterLayer` -- a read-write layer over one named set. ``ttl`` is
+  required (persisting a secret to disk is an explicit choice). It performs the
+  purge-on-load and locked merge-on-persist of the underlying engine.
+* :func:`clear_cache_file` -- delete the whole cache file (every set).
 
-* **Wall-clock TTL.** :class:`CachingBackend` stamps entries with
-  :func:`time.monotonic`, which resets every process start and is meaningless
-  across runs. This backend stamps with :func:`time.time` and expires against
-  it.
-* **Only ``read()`` is persisted.** ``get_item`` / ``list_items`` /
-  ``list_vaults`` pass straight through — serializing item graphs is out of
-  scope and not what the cache exists for.
+Layers carry no locks; the resolver owns locking (see
+:mod:`op_core.backends.stack`).
 
-On-disk model. All processes share **one cache file**
-holding multiple **sets**, keyed by a caller-chosen ``bucket`` id (the CLI uses
-a hash of the resolved reference set). A set is the unit of caching intent: it
-is stamped with the TTL its writer was constructed with, and every entry in it
-expires against that stored TTL. The TTL is therefore writer-owned — a reader
-can never stretch an entry's life beyond the writer's intention. A backend that
-opens its own set and finds a *different* stored TTL discards the set and
-rebuilds it ("a different TTL means the cache is reconstructed"); there is no
-override path. The same credential cached under two sets is two independent
-entries with independent TTLs — that duplication is deliberate TTL isolation.
+On-disk model. All processes share **one cache file** holding multiple
+**sets**, keyed by a caller-chosen ``bucket`` id (``op-env`` uses a hash of the
+resolved reference set). A set is the unit of caching intent: it is stamped with
+the TTL its writer was constructed with, and every entry expires against that
+stored TTL. The TTL is writer-owned -- a reader can never stretch an entry past
+its writer's intention. A writer that opens its own set and finds a *different*
+stored TTL discards and rebuilds it; there is no override path.
 
-Hygiene properties of the single file:
+Hygiene (writer-side -- readers never write):
 
-* **Purge-on-load.** Every load walks *all* sets and drops entries expired by
-  their own set's TTL (and sets left empty), rewriting the file if anything was
-  dropped. Any invocation anywhere scrubs everyone's stale plaintext.
+* **Purge-on-load.** Every writer load walks *all* sets and drops entries
+  expired by their own set's TTL (and empties), rewriting the file if anything
+  was dropped -- any writer invocation scrubs everyone's stale plaintext.
 * **Locked merge-on-persist.** Writes re-read the file under an exclusive
-  ``flock``, replace the writer's own set (merging entries newest-wins when the
-  TTL matches), purge the others, and write atomically — so concurrent
-  processes can neither clobber each other's sets nor resurrect purged entries.
+  ``flock``, replace the writer's own set (merging newest-wins when the TTL
+  matches), purge the others, and write atomically -- so concurrent processes
+  neither clobber each other's sets nor resurrect purged entries.
 
 The file content is **scrambled, not encrypted**: the serialized payload is
 zlib-compressed and XOR-ed with a SHA-256 keystream derived from machine-local
 material (machine-id + uid) and a per-write random nonce. The threat model is
-casual or offline reading — ``cat``/``grep``, secret scanners, backups, or the
+casual or offline reading -- ``cat``/``grep``, secret scanners, backups, or the
 file copied off the machine (where the key material is absent). It does *not*
-protect against a same-user process that runs this code; nothing without an
-external secret store can. Defense against other users is unchanged: the file
-is created ``0600`` inside a ``0700`` directory, defaults to a RAM-backed
-location, and is ignored on load if its ownership or permissions look tampered
-with. A corrupt or unreadable cache never crashes the caller — it degrades to
-the wrapped backend with a non-secret warning (and, when the file is ours, is
-rewritten, scrubbing whatever stale content it held).
+protect against a same-user process. Defense against other users: the file is
+``0600`` inside a ``0700`` directory, defaults to a RAM-backed location, and is
+ignored on load if its ownership or permissions look tampered with. A corrupt or
+unreadable cache never crashes the caller -- it degrades to empty (and, for a
+writer whose file is ours, is rewritten, scrubbing whatever stale content it
+held).
 
-``ttl<=0`` disables persistence entirely (the backend becomes an effective
-pass-through).
+``ttl <= 0`` disables persistence (a :class:`FileWriterLayer` becomes inert).
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import fcntl
 import functools
@@ -69,20 +62,16 @@ import logging
 import os
 import stat
 import tempfile
-import threading
 import time
 import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from op_core.backends.caching import _NOT_FOUND, CacheEntry, _Store
-from op_core.exceptions import OpNotFoundError, OpOfflineError
-from op_core.items import Item, ItemRef, ItemSummary, VaultSummary
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Sequence
+    from collections.abc import Generator
 
-    from op_core.backends.base import AsyncBackend, Backend
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +82,8 @@ _MAGIC = b"OPC1"
 _NONCE_LEN = 16
 _KEY_CONTEXT = b"op-core-cache"
 _MACHINE_ID_PATHS = ("/etc/machine-id", "/var/lib/dbus/machine-id")
+_MSG_WRITE_FAILED = "could not write cache file %s: %s"
+_MSG_UNTRUSTED_FILE = "ignoring cache file with unexpected ownership/permissions: %s"
 
 # A set as serialized: {"ttl": float, "entries": {key: {"value"|"miss", "cached_at"}}}
 _Sets = dict[str, dict[str, Any]]
@@ -103,22 +94,29 @@ def _wallclock() -> float:
     return time.time()
 
 
-def default_cache_dir() -> Path:
-    """Return the directory persistent caches live in, creating it ``0700``.
+def _default_cache_path() -> Path:
+    """Compute the default cache file location without touching the filesystem.
 
     Prefers ``$XDG_RUNTIME_DIR/op-core`` (a per-user, RAM-backed, ``0700``
     location that is cleared on logout). Falls back to
     ``$TMPDIR/op-core-<uid>`` (``/tmp`` when ``TMPDIR`` is unset).
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        return Path(runtime) / "op-core" / _DEFAULT_FILENAME
+    tmp = os.environ.get("TMPDIR") or "/tmp"  # 0700 per-uid subdir, secured by callers
+    return Path(tmp) / f"op-core-{_uid()}" / _DEFAULT_FILENAME
+
+
+def default_cache_dir() -> Path:
+    """Return the directory persistent caches live in, creating it ``0700``.
+
+    See :func:`_default_cache_path` for the location policy.
 
     Raises :class:`OSError` if the directory cannot be created or secured. The
     CLI catches this and runs without a persistent cache rather than failing.
     """
-    runtime = os.environ.get("XDG_RUNTIME_DIR")
-    if runtime:
-        target = Path(runtime) / "op-core"
-    else:
-        tmp = os.environ.get("TMPDIR") or "/tmp"  # 0700 per-uid subdir, secured below
-        target = Path(tmp) / f"op-core-{_uid()}"
+    target = _default_cache_path().parent
     _secure_dir(target)
     return target
 
@@ -215,6 +213,8 @@ class _FileCache:
         path: str | Path | None,
         bucket: str = _DEFAULT_BUCKET,
     ) -> None:
+        if not isinstance(ttl, (int, float)) or isinstance(ttl, bool):
+            raise TypeError("ttl must be a number of seconds; for read-only access use FileReaderLayer")
         self._ttl = ttl
         self._bucket = bucket
         self._max_entries = max_entries
@@ -226,11 +226,17 @@ class _FileCache:
     # -- public, lock-free helpers (callers hold the backend lock) ----------
 
     def lookup(self, key: str) -> CacheEntry | None:
-        """Return a live entry for ``key`` or ``None`` (absent or expired)."""
+        """Return a live entry for ``key`` or ``None`` (absent or expired).
+
+        Uses a two-sided bound ``0 <= age <= ttl`` so that future-dated entries
+        (negative age, i.e. clock skew) are treated as expired rather than
+        immortal (FIX-2).
+        """
         entry = self._store.get(key)
         if entry is None:
             return None
-        if (_wallclock() - entry.cached_at) > self._ttl:
+        age = _wallclock() - entry.cached_at
+        if not 0 <= age <= self._ttl:
             self._store.delete(key)
             return None
         return entry
@@ -239,6 +245,40 @@ class _FileCache:
         """Store ``value`` (or the ``_NOT_FOUND`` sentinel) and persist."""
         self._store.put(key, CacheEntry(key=key, value=value, cached_at=_wallclock(), metadata={}))
         self._persist()
+
+    def clear(self) -> None:
+        """Drop every entry: wipe the in-memory store and delete the own set on disk.
+
+        Both halves are required — persist merges with the on-disk set
+        newest-wins, so a memory-only clear would resurrect on the next store.
+        """
+        self._store.clear()
+        if self._path is None:
+            return
+        try:
+            with self._locked():
+                sets, _ = self._read_sets()
+                sets.pop(self._bucket, None)
+                self._write_sets(sets)
+        except OSError as exc:
+            log.warning(_MSG_WRITE_FAILED, self._path, exc)
+
+    def clear_misses(self) -> None:
+        """Forget negative-cache records, in memory and in the own set on disk."""
+        self._store.clear_misses()
+        if self._path is None:
+            return
+        try:
+            with self._locked():
+                sets, _ = self._read_sets()
+                own = sets.get(self._bucket)
+                if own is not None:
+                    own["entries"] = {k: e for k, e in own["entries"].items() if not e.get("miss")}
+                    if not own["entries"]:
+                        del sets[self._bucket]
+                self._write_sets(sets)
+        except OSError as exc:
+            log.warning(_MSG_WRITE_FAILED, self._path, exc)
 
     @property
     def persistent(self) -> bool:
@@ -309,7 +349,7 @@ class _FileCache:
                 sets[self._bucket] = {"ttl": self._ttl, "entries": self._merged_own_entries(sets)}
                 self._write_sets(sets)
         except OSError as exc:
-            log.warning("could not write cache file %s: %s", self._path, exc)
+            log.warning(_MSG_WRITE_FAILED, self._path, exc)
 
     def _merged_own_entries(self, sets: _Sets) -> dict[str, dict[str, Any]]:
         """Merge this store's entries with the own set on disk, newest-wins.
@@ -349,7 +389,7 @@ class _FileCache:
         except OSError:
             return {}, False  # no cache yet — normal first run
         if not self._is_trustworthy(info):
-            log.warning("ignoring cache file with unexpected ownership/permissions: %s", path)
+            log.warning(_MSG_UNTRUSTED_FILE, path)
             return {}, False
         try:
             sets = self._validated_sets(_decode_payload(path.read_bytes()))
@@ -395,7 +435,7 @@ class _FileCache:
         dead: list[str] = []
         for bucket, record in sets.items():
             entries = record["entries"]
-            live = {k: e for k, e in entries.items() if (now - e["cached_at"]) <= record["ttl"]}
+            live = {k: e for k, e in entries.items() if 0 <= (now - e["cached_at"]) <= record["ttl"]}
             if len(live) != len(entries):
                 record["entries"] = live
                 dirty = True
@@ -430,118 +470,180 @@ def _atomic_write(path: Path, blob: bytes) -> None:
         raise
 
 
-def _unpack_read(entry: CacheEntry, reference: str, default_value: str | None) -> str:
-    if entry.value is _NOT_FOUND:
-        if default_value is not None:
-            return default_value
-        raise OpNotFoundError(reference)
-    return entry.value
+def _load_reader_state(path: Path, bucket: str) -> tuple[float, dict[str, CacheEntry]]:
+    """Lock-free, write-free snapshot of one set: ``(stored_ttl, live entries)``.
+
+    Returns an empty state when the file is missing, untrustworthy, corrupt, or
+    holds no such set — the reader then degrades to a pass-through. Entries
+    already expired by the set's stored TTL are not loaded; entries stamped in
+    the future (clock skew) are treated as expired, not immortal.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return 0.0, {}  # no cache yet — normal
+    if not _FileCache._is_trustworthy(info):
+        log.warning(_MSG_UNTRUSTED_FILE, path)
+        return 0.0, {}
+    try:
+        sets = _FileCache._validated_sets(_decode_payload(path.read_bytes()))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        log.warning("ignoring unreadable/corrupt cache file %s: %s", path, exc)
+        return 0.0, {}
+    own = sets.get(bucket)
+    if own is None:
+        return 0.0, {}
+    ttl: float = own["ttl"]
+    now = _wallclock()
+    entries: dict[str, CacheEntry] = {}
+    for key, record in own["entries"].items():
+        if 0 <= (now - record["cached_at"]) <= ttl:
+            value: Any = _NOT_FOUND if record.get("miss") else record["value"]
+            entries[key] = CacheEntry(key=key, value=value, cached_at=record["cached_at"], metadata={})
+    return ttl, entries
 
 
-class FileCachingBackend:
-    """Sync persistent caching decorator. Wraps any :class:`Backend`."""
+def _live_reader_entry(entries: dict[str, CacheEntry], key: str, ttl: float) -> CacheEntry | None:
+    """Return a still-live entry from a reader snapshot, or None if absent or expired.
+
+    Does not mutate ``entries`` -- FileReaderLayer is a pure observer of an
+    immutable snapshot. Expired entries are simply not served; they age out
+    logically without being deleted from the dict.
+    """
+    entry = entries.get(key)
+    if entry is None:
+        return None
+    if not 0 <= (_wallclock() - entry.cached_at) <= ttl:
+        return None
+    return entry
+
+
+def _inspect_sets(path: Path) -> _Sets | None:
+    """Read-only decode of *every* set for inspection — no purge, no write, no live filter.
+
+    Returns the raw validated sets exactly as they sit on disk (expired entries
+    included), or ``None`` when the file is missing, untrustworthy, or
+    unreadable. This is the cold-path companion to :func:`_load_reader_state`
+    (which loads one bucket's *live* entries); it backs ``op-cache info``, which
+    reports counts and ages without mutating the file.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if not _FileCache._is_trustworthy(info):
+        log.warning(_MSG_UNTRUSTED_FILE, path)
+        return None
+    try:
+        return _FileCache._validated_sets(_decode_payload(path.read_bytes()))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        log.warning("ignoring unreadable/corrupt cache file %s: %s", path, exc)
+        return None
+
+
+class FileReaderLayer:
+    """Read-only cache layer: one-time snapshot of one named bucket.
+
+    A pure observer of the cache file. Loads its bucket once at construction
+    (lock-free — atomic writes guarantee a consistent read), serves entries while
+    they are live by the set's *stored* TTL, and never touches the filesystem
+    afterwards: no entries added, no misses recorded, no purge rewrite, no lock
+    sidecar, no corrupt-file scrub.
+
+    ``path=None`` uses the standard location (``$XDG_RUNTIME_DIR/op-core/`` or
+    ``$TMPDIR/op-core-<uid>/``). No directory is created — if the path does not
+    exist the layer degrades to "no entries" and the resolver falls through.
+
+    Satisfies :class:`~op_core.backends.stack.CacheLayer` only (not writable).
+    The resolver owns locking; this layer carries none. An instance must not be
+    shared between stacks.
+    """
+
+    def __init__(self, bucket: str = _DEFAULT_BUCKET, path: str | Path | None = None) -> None:
+        resolved = Path(path) if path is not None else _default_cache_path()
+        self._set_ttl, self._entries = _load_reader_state(resolved, bucket)
+
+    def lookup(self, reference: str) -> CacheEntry | None:
+        """Return a still-live entry for ``reference``, or ``None``."""
+        return _live_reader_entry(self._entries, reference, self._set_ttl)
+
+
+class FileWriterLayer:
+    """Read-write cache layer backed by one named bucket in the shared cache file.
+
+    Wraps :class:`_FileCache` and exposes the
+    :class:`~op_core.backends.stack.WritableCacheLayer` interface. The
+    resolver owns locking; this layer carries none.
+
+    ``ttl`` is **required** with no default — persisting secrets to disk is an
+    explicit caller decision (design section 6). ``ttl <= 0`` disables
+    persistence: the layer behaves as an in-memory-only store that writes no
+    file and survives only for the lifetime of this object.
+
+    Construction performs purge-on-load: any writer invocation scrubs everyone's
+    stale entries from the shared file (existing ``_FileCache`` behavior,
+    unchanged).
+    """
 
     def __init__(
         self,
-        inner: Backend,
-        *,
-        ttl: float = 300.0,
-        max_entries: int = 1024,
-        path: str | Path | None = None,
+        ttl: float,
         bucket: str = _DEFAULT_BUCKET,
-    ) -> None:
-        self._inner = inner
-        self._cache = _FileCache(ttl=ttl, max_entries=max_entries, path=path, bucket=bucket)
-        self._lock = threading.Lock()
-
-    def read(self, reference: str, *, default_value: str | None = None, online: bool = True) -> str:
-        with self._lock:
-            entry = self._cache.lookup(reference)
-        if entry is not None:
-            return _unpack_read(entry, reference, default_value)
-
-        if not online:
-            raise OpOfflineError(f"reference not cached: {reference}")
-
-        try:
-            value: Any = self._inner.read(reference)
-        except OpNotFoundError:
-            with self._lock:
-                self._cache.store(reference, _NOT_FOUND)
-            if default_value is not None:
-                return default_value
-            raise OpNotFoundError(reference) from None
-        with self._lock:
-            self._cache.store(reference, value)
-        return value
-
-    def list_items(
-        self,
-        *,
-        vault: str | None = None,
-        tags: Sequence[str] | None = None,
-        categories: Sequence[str] | None = None,
-    ) -> list[ItemSummary]:
-        return self._inner.list_items(vault=vault, tags=tags, categories=categories)
-
-    def list_vaults(self) -> list[VaultSummary]:
-        return self._inner.list_vaults()
-
-    def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
-        return self._inner.get_item(item, vault=vault)
-
-
-class AsyncFileCachingBackend:
-    """Async persistent caching decorator. Wraps any :class:`AsyncBackend`."""
-
-    def __init__(
-        self,
-        inner: AsyncBackend,
-        *,
-        ttl: float = 300.0,
-        max_entries: int = 1024,
         path: str | Path | None = None,
-        bucket: str = _DEFAULT_BUCKET,
+        max_entries: int = 1024,
     ) -> None:
-        self._inner = inner
+        if max_entries <= 0:
+            raise ValueError("max_entries must be positive")
         self._cache = _FileCache(ttl=ttl, max_entries=max_entries, path=path, bucket=bucket)
-        # asyncio.Lock — consistent with AsyncCachingBackend. The disk write
-        # inside the lock is intentional: the file is RAM-backed and the caller
-        # is a short-lived CLI, so the synchronous write is acceptable here.
-        self._lock = asyncio.Lock()
 
-    async def read(self, reference: str, *, default_value: str | None = None, online: bool = True) -> str:
-        async with self._lock:
-            entry = self._cache.lookup(reference)
-        if entry is not None:
-            return _unpack_read(entry, reference, default_value)
+    def lookup(self, reference: str) -> CacheEntry | None:
+        """Return a live entry for ``reference``, or ``None``."""
+        return self._cache.lookup(reference)
 
-        if not online:
-            raise OpOfflineError(f"reference not cached: {reference}")
+    def store(self, reference: str, value: object) -> None:
+        """Store ``value`` (a string or the miss sentinel) and persist to disk."""
+        self._cache.store(reference, value)
 
-        try:
-            value: Any = await self._inner.read(reference)
-        except OpNotFoundError:
-            async with self._lock:
-                self._cache.store(reference, _NOT_FOUND)
-            if default_value is not None:
-                return default_value
-            raise OpNotFoundError(reference) from None
-        async with self._lock:
-            self._cache.store(reference, value)
-        return value
+    def clear(self) -> None:
+        """Drop every entry in memory and delete the own set on disk.
 
-    async def list_items(
-        self,
-        *,
-        vault: str | None = None,
-        tags: Sequence[str] | None = None,
-        categories: Sequence[str] | None = None,
-    ) -> list[ItemSummary]:
-        return await self._inner.list_items(vault=vault, tags=tags, categories=categories)
+        Both halves are cleared so a later ``store()`` cannot resurrect cleared
+        entries via the merge-on-persist cycle.
+        """
+        self._cache.clear()
 
-    async def list_vaults(self) -> list[VaultSummary]:
-        return await self._inner.list_vaults()
+    def clear_misses(self) -> None:
+        """Drop negative-cache records in memory and from the own disk set."""
+        self._cache.clear_misses()
 
-    async def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:
-        return await self._inner.get_item(item, vault=vault)
+
+def clear_cache_file(path: str | Path | None = None) -> None:
+    """Delete the cache file — every set, every bucket.
+
+    ``path=None`` targets the standard location (``$XDG_RUNTIME_DIR/op-core/``
+    or ``$TMPDIR/op-core-<uid>/``). The operation is a no-op when the file or
+    its directory does not exist.
+
+    **Locking and FIX-1.** The deletion is taken under the exclusive flock on
+    the ``.lock`` sidecar so a concurrent writer's read-merge-write cycle is not
+    torn. Only the cache file is unlinked; the sidecar is deliberately **left in
+    place**. Unlinking the sidecar while still holding its flock would allow a
+    concurrent writer to open a fresh inode for the same path and acquire what
+    it believes is the same lock — bypassing mutual exclusion entirely. The
+    sidecar is a zero-byte file; the locking path recreates it anyway, so
+    leaving it costs nothing.
+    """
+    target = Path(path) if path is not None else _default_cache_path()
+    lock_path = target.with_name(target.name + ".lock")
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        return  # directory does not exist — nothing to clear
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with contextlib.suppress(OSError):
+            target.unlink(missing_ok=True)
+        # FIX-1: leave the sidecar in place; unlinking it under its own flock
+        # would let a concurrent writer open a fresh inode and skip the lock.
+    finally:
+        os.close(fd)

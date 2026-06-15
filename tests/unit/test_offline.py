@@ -2,9 +2,9 @@
 
 Verifies the safety-rail contract: when a caller sets ``online=False``, a
 backend must satisfy the request from local state alone. Raw backends
-(CLI/SDK) can never satisfy offline reads. CachingBackend returns live
-cached entries or raises. InMemoryBackend honors the flag locally and
-propagates it to any ``fallback`` backend.
+(CLI/SDK) can never satisfy offline reads. A ``ResolverStack`` serves live
+cached entries from its layers or raises. ``InMemoryBackend`` honors the flag
+locally and propagates it to any ``fallback`` backend.
 """
 
 from __future__ import annotations
@@ -12,10 +12,10 @@ from __future__ import annotations
 import pytest
 
 from op_core.auth import DesktopAuth, ServiceAccountAuth
-from op_core.backends.caching import AsyncCachingBackend, CachingBackend
 from op_core.backends.cli import AsyncCLIBackend, CLIBackend
 from op_core.backends.memory import InMemoryBackend
 from op_core.backends.sdk import AsyncSDKBackend, SDKBackend
+from op_core.backends.stack import AsyncResolverStack, MemoryLayer, ResolverStack
 from op_core.exceptions import OpNotFoundError, OpOfflineError
 
 # ---------- CLI / SDK raw backends ----------
@@ -23,29 +23,29 @@ from op_core.exceptions import OpNotFoundError, OpOfflineError
 
 class TestCLIOffline:
     def test_read_offline_raises_before_subprocess(self):
-        backend = CLIBackend(auth=DesktopAuth(), binary='/usr/bin/true')
-        with pytest.raises(OpOfflineError, match='CLIBackend'):
-            backend.read('op://v/i/f', online=False)
+        backend = CLIBackend(auth=DesktopAuth(), binary="/usr/bin/true")
+        with pytest.raises(OpOfflineError, match="CLIBackend"):
+            backend.read("op://v/i/f", online=False)
 
     async def test_async_read_offline_raises_before_subprocess(self):
-        backend = AsyncCLIBackend(auth=DesktopAuth(), binary='/usr/bin/true')
-        with pytest.raises(OpOfflineError, match='AsyncCLIBackend'):
-            await backend.read('op://v/i/f', online=False)
+        backend = AsyncCLIBackend(auth=DesktopAuth(), binary="/usr/bin/true")
+        with pytest.raises(OpOfflineError, match="AsyncCLIBackend"):
+            await backend.read("op://v/i/f", online=False)
 
 
 class TestSDKOffline:
     def test_sync_offline_raises(self):
-        backend = SDKBackend(ServiceAccountAuth(token='stub'))
-        with pytest.raises(OpOfflineError, match='SDKBackend'):
-            backend.read('op://v/i/f', online=False)
+        backend = SDKBackend(ServiceAccountAuth(token="stub"))
+        with pytest.raises(OpOfflineError, match="SDKBackend"):
+            backend.read("op://v/i/f", online=False)
 
     async def test_async_offline_raises(self):
-        backend = AsyncSDKBackend(ServiceAccountAuth(token='stub'))
-        with pytest.raises(OpOfflineError, match='AsyncSDKBackend'):
-            await backend.read('op://v/i/f', online=False)
+        backend = AsyncSDKBackend(ServiceAccountAuth(token="stub"))
+        with pytest.raises(OpOfflineError, match="AsyncSDKBackend"):
+            await backend.read("op://v/i/f", online=False)
 
 
-# ---------- CachingBackend ----------
+# ---------- ResolverStack (one MemoryLayer over a source) ----------
 
 
 class _Stub:
@@ -60,6 +60,9 @@ class _Stub:
         raise OpNotFoundError(reference)
 
     def list_items(self, **kwargs):
+        return []
+
+    def list_vaults(self):
         return []
 
     def get_item(self, item, *, vault=None):
@@ -80,65 +83,63 @@ class _AsyncStub:
     async def list_items(self, **kwargs):
         return []
 
+    async def list_vaults(self):
+        return []
+
     async def get_item(self, item, *, vault=None):
         raise OpNotFoundError(item)
 
 
-class TestCachingOffline:
+class TestResolverStackOffline:
     def test_offline_hit_returns_cached(self):
-        inner = _Stub(refs={'op://v/i/f': 'val'})
-        cache = CachingBackend(inner)
-        # Populate the cache
-        assert cache.read('op://v/i/f') == 'val'
-        # Subsequent offline read should hit cache without touching inner
-        assert cache.read('op://v/i/f', online=False) == 'val'
-        assert inner.read_calls == 1  # only the initial populate
+        source = _Stub(refs={"op://v/i/f": "val"})
+        stack = ResolverStack([MemoryLayer()], source)
+        # Populate (online): resolves through source and back-fills the memory layer.
+        assert stack.read("op://v/i/f") == "val"
+        # Subsequent offline read is served from the layer without touching the source.
+        assert stack.read("op://v/i/f", online=False) == "val"
+        assert source.read_calls == 1
 
     def test_offline_miss_raises_offline_error(self):
-        inner = _Stub()
-        cache = CachingBackend(inner)
+        source = _Stub()
+        stack = ResolverStack([MemoryLayer()], source)
         with pytest.raises(OpOfflineError):
-            cache.read('op://v/i/missing', online=False)
-        # Inner was never touched
-        assert inner.read_calls == 0
+            stack.read("op://v/i/missing", online=False)
+        assert source.read_calls == 0
 
-    def test_offline_never_delegates_to_inner(self):
-        inner = _Stub(refs={'op://v/i/f': 'val'})
-        cache = CachingBackend(inner)
-        # Cache is empty; inner has it; offline must NOT delegate
+    def test_offline_never_delegates_to_source(self):
+        source = _Stub(refs={"op://v/i/f": "val"})
+        stack = ResolverStack([MemoryLayer()], source)
+        # Cache empty; source has it; offline must NOT delegate.
         with pytest.raises(OpOfflineError):
-            cache.read('op://v/i/f', online=False)
-        assert inner.read_calls == 0
+            stack.read("op://v/i/f", online=False)
+        assert source.read_calls == 0
 
     def test_offline_cached_not_found_raises_not_found(self):
-        """Confirmed-absent (cached _NOT_FOUND) raises OpNotFoundError,
-        not OpOfflineError — the cache is authoritative for this key.
-        """
-        inner = _Stub()  # no refs → raises OpNotFoundError on any read
-        cache = CachingBackend(inner)
-        # Populate negative entry
+        # A stored miss is authoritative even offline: OpNotFoundError, not OpOfflineError.
+        source = _Stub()
+        stack = ResolverStack([MemoryLayer()], source)
         with pytest.raises(OpNotFoundError):
-            cache.read('op://v/i/missing')
-        # Subsequent offline read hits the _NOT_FOUND sentinel
+            stack.read("op://v/i/missing")  # populate the negative entry
         with pytest.raises(OpNotFoundError):
-            cache.read('op://v/i/missing', online=False)
-        assert inner.read_calls == 1  # only the first populate
+            stack.read("op://v/i/missing", online=False)
+        assert source.read_calls == 1
 
 
-class TestAsyncCachingOffline:
+class TestAsyncResolverStackOffline:
     async def test_offline_hit(self):
-        inner = _AsyncStub(refs={'op://v/i/f': 'val'})
-        cache = AsyncCachingBackend(inner)
-        assert await cache.read('op://v/i/f') == 'val'
-        assert await cache.read('op://v/i/f', online=False) == 'val'
-        assert inner.read_calls == 1
+        source = _AsyncStub(refs={"op://v/i/f": "val"})
+        stack = AsyncResolverStack([MemoryLayer()], source)
+        assert await stack.read("op://v/i/f") == "val"
+        assert await stack.read("op://v/i/f", online=False) == "val"
+        assert source.read_calls == 1
 
     async def test_offline_miss_raises(self):
-        inner = _AsyncStub()
-        cache = AsyncCachingBackend(inner)
+        source = _AsyncStub()
+        stack = AsyncResolverStack([MemoryLayer()], source)
         with pytest.raises(OpOfflineError):
-            await cache.read('op://v/i/missing', online=False)
-        assert inner.read_calls == 0
+            await stack.read("op://v/i/missing", online=False)
+        assert source.read_calls == 0
 
 
 # ---------- Composition: InMemory + CLI fallback (the wrap-phase pattern) ----------
@@ -148,23 +149,23 @@ class TestWrapPhasePattern:
     def test_hostdata_pattern_uses_local_first(self):
         """Known values come from hostdata; unknown references fail offline."""
         # Only a CLI fallback (which always raises offline)
-        cli = CLIBackend(auth=DesktopAuth(), binary='/usr/bin/true')
+        cli = CLIBackend(auth=DesktopAuth(), binary="/usr/bin/true")
         backend = InMemoryBackend(
-            refs={'op://v/i/known': 'pre_resolved'},
+            refs={"op://v/i/known": "pre_resolved"},
             fallback=cli,
         )
         # Known ref: local hit, no subprocess
-        assert backend.read('op://v/i/known', online=False) == 'pre_resolved'
+        assert backend.read("op://v/i/known", online=False) == "pre_resolved"
         # Unknown ref: falls through to CLI which raises offline
         with pytest.raises(OpOfflineError):
-            backend.read('op://v/i/unknown', online=False)
+            backend.read("op://v/i/unknown", online=False)
 
     def test_online_true_allows_fallback_fetch(self):
         """With online=True, fallback can fetch unknowns. Using _Stub as stand-in."""
-        stub = _Stub(refs={'op://v/i/unknown': 'from_fallback'})
+        stub = _Stub(refs={"op://v/i/unknown": "from_fallback"})
         backend = InMemoryBackend(
-            refs={'op://v/i/known': 'local'},
+            refs={"op://v/i/known": "local"},
             fallback=stub,  # type: ignore[arg-type]
         )
-        assert backend.read('op://v/i/known') == 'local'
-        assert backend.read('op://v/i/unknown') == 'from_fallback'
+        assert backend.read("op://v/i/known") == "local"
+        assert backend.read("op://v/i/unknown") == "from_fallback"

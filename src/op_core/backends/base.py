@@ -4,8 +4,8 @@ These describe the read-only surface every op-core backend must expose.
 CRUD (`create_item`, `edit_item`, `delete_item`) is intentionally deferred
 until the `ItemSpec` / `ItemPatch` shapes land.
 
-Caching is *not* part of the protocol — it is layered on via the
-`CachingBackend` decorator.
+Caching is *not* part of the protocol — it is layered on via a
+`ResolverStack` (see `op_core.backends.stack`).
 """
 
 from __future__ import annotations
