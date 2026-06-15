@@ -4,7 +4,8 @@
 :class:`~op_core.backends.base.Backend` (or ``AsyncBackend``) with the
 :class:`~op_core.field.FieldValue` resolution helpers. They are intentionally
 thin — caching, auth, and transport concerns belong to the backend layer.
-If you want caching, wrap your backend in :class:`~op_core.backends.caching.CachingBackend`
+If you want caching, compose your backend in a
+:class:`~op_core.backends.stack.ResolverStack` with the layers you want
 before passing it in. If you want custom auth or binary, construct the
 backend explicitly instead of relying on :func:`~op_core.backends.detect.detect_backend`.
 """

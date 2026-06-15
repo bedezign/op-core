@@ -5,6 +5,35 @@ All notable changes to op-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-06-11
+
+### Added
+
+- **`ResolverStack(layers, source)` / `AsyncResolverStack(layers, source)`** — an ordered list of cache layers over one source backend. Satisfies the `Backend` protocol, so `OnePassword(backend=stack)` works unchanged. The read walk is first-live-hit-wins with read-through back-fill into the writable layers above the hit; `get_item` / `list_items` / `list_vaults` route straight to the source. Fan-out `clear()` / `clear_misses()` touch every writable layer. Exported flat from `op_core`.
+- **`MemoryLayer(ttl=300.0, max_entries=1024)`** — in-process read-write layer backed by an LRU store with monotonic-clock TTL expiry. Replaces the retired `CachingBackend`'s `read()` memoization. (`get_item` memoization and the `is_expired` predicate hook do not carry over — see Removed below.)
+- **`FileReaderLayer(bucket="default", path=None)`** — read-only observer of one named on-disk set. Loads one consistent snapshot at construction (lock-free; atomic writes make it safe), honors the set's stored TTL, treats future-dated entries as expired, and degrades gracefully to "no entries" when the file is missing, corrupt, or holds no such bucket. Never writes: no entries added, no misses recorded, no purge rewrite, no lock sidecar.
+- **`FileWriterLayer(ttl, bucket="default", path=None, max_entries=1024)`** — read-write on-disk layer over the same scrambled, purge-on-load, locked-merge-on-persist engine that shipped in 0.5.0. **`ttl` is required and has no default** — persisting a secret to disk must be an explicit caller choice. Exposes `clear()` / `clear_misses()` that retract both the in-memory mirror and the on-disk set, so a later merge cannot resurrect cleared entries.
+- **`clear_cache_file(path=None)`** — delete the whole cache file (every set, every bucket), taken under the inter-process lock. Called by `op-cache clear`. Exported flat from `op_core`.
+- **`op-cache` command** — standalone cache-management CLI, pure standard library, in the base install (no extra required):
+  - `op-cache clear` — delete the cache file. Cold; no auth.
+  - `op-cache info` — print file metadata and per-set statistics (bucket id, value and miss counts, stored TTL, entry ages, time to next expiry). Cold; no auth. **Never prints secret values or `op://` reference strings** — those are exactly what the on-disk scrambling protects.
+  - `op-cache refresh --bucket ID` — re-resolve one named set's live entries through a source backend and re-store them under the set's own stored TTL. Interactive and auth-gated: with desktop auth this triggers an approval prompt (possibly biometric). **Do not bury it in non-interactive automation** that cannot satisfy the prompt — a stalled prompt looks like a hang. `--bucket` is required; there is no whole-file refresh. Limitation: refresh extends a live set before expiry; it cannot resurrect a set after expiry (expired entries are purged from the file).
+
+### Changed
+
+- **Per-layer expiry now uses a two-sided bound (`0 <= age <= ttl`):** a future-dated entry (clock skew) is treated as expired by the on-disk writer's lookup and purge too, matching the reader. Clock skew is not immortality.
+
+### Removed
+
+- **BREAKING: the caching decorators are removed.** `CachingBackend`, `AsyncCachingBackend`, `FileCachingBackend`, and `AsyncFileCachingBackend` no longer exist. Compose caching explicitly instead: wrap your source backend in a `ResolverStack` and place the layers you want — `MemoryLayer` for in-process caching, `FileWriterLayer(ttl=...)` for the on-disk cache (the TTL is now required and has no default). Cache files written by previous releases remain readable. Two features do not return: `get_item()` results are no longer cached anywhere (only `read()` goes through the layers), and the `is_expired` callback has no layer equivalent. See the migration recipes in the README.
+- **BREAKING: `op-env` no longer persists resolved secrets by default, and `--no-cache` is removed.** From 0.4.0 through 0.5.0, every `op-env` run wrote resolved values to the on-disk cache with a 300 second TTL unless `--no-cache` was passed. Caching is now strictly opt-in: pass `--ttl N` (N > 0) to enable it. Runs without `--ttl` resolve through 1Password every time — with desktop auth this means an approval prompt per run. To restore the previous behavior, add `--ttl 300`. `--no-cache` is removed outright: invocations that still pass it now fail with an unknown-flag error — delete the flag; its behavior is the new default. Rationale: writing secrets to disk must be an explicit choice, never a default side effect.
+- **`ttl_is_expired` is removed** from `op_core.backends`. It was the default-expiry predicate for the retired decorators and has no caller now that `MemoryLayer` inlines its TTL check. The one-line equivalent, if you need it, is `(time.monotonic() - cached_at) > ttl`.
+
+### Notes
+
+- **On-disk format unchanged.** Cache files written by 0.4.0 and 0.5.0 remain readable; no migration of the file itself is needed.
+- **Staleness caveat.** A cached secret is the value that was live at the moment it was written, served unchanged for the full TTL window. Rotating or editing the item in 1Password does not invalidate any cache entry: there is no invalidation signal, and reads never re-check upstream while an entry is live. If a credential is rotated mid-window, every consumer of the cache keeps receiving the retired value until the entry expires, the cache is cleared (`op-cache clear`), or re-resolved (`op-cache refresh`). This applies to any writer layer, memory or file. Choose TTLs with your rotation procedures in mind, and make `op-cache clear` part of any manual rotation runbook.
+
 ## [0.5.0] — 2026-06-10
 
 ### Changed

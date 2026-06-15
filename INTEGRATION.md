@@ -6,9 +6,9 @@ For a high-level overview, see [`README.md`](README.md). For release notes, see 
 
 ## Status
 
-`v0.5.0` — pre-1.0. The API is stable enough to build against, but minor breaking changes are possible before `v1.0`. Specifically:
+`v0.6.0` — pre-1.0. The API is stable enough to build against, but minor breaking changes are possible before `v1.0`. Specifically:
 
-- Item CRUD (`create_item` / `edit_item` / `delete_item`) is not built. See the README's "What it deliberately does not ship" section. (The `op-env` subprocess runner and the `FileCachingBackend` persistent cache shipped in 0.4.0.)
+- Item CRUD (`create_item` / `edit_item` / `delete_item`) is not built. See the README's "What it deliberately does not ship" section. (The `op-env` subprocess runner and persistent file caching shipped in 0.4.0; the resolver stack — `ResolverStack`, `MemoryLayer`, `FileReaderLayer`, `FileWriterLayer` — and the `op-cache` CLI shipped in 0.6.0, replacing the removed decorator classes.)
 - No template / variable-substitution engine, ever. Field values are full `op://` / `ops://` references or literals, with optional `||` fallback chains. If you need richer interpolation (shell variables, embedded templates, etc.), do it in your own code before calling `op.read()` / `op.resolve()`.
 
 ## Install
@@ -34,8 +34,8 @@ pip install "op-core[sdk] @ git+https://github.com/bedezign/op-core"
 Pin to a tag for reproducibility:
 
 ```bash
-uv add "op-core @ git+https://github.com/bedezign/op-core@v0.4.0"
-pip install "op-core @ git+https://github.com/bedezign/op-core@v0.4.0"
+uv add "op-core @ git+https://github.com/bedezign/op-core@v0.5.0"
+pip install "op-core @ git+https://github.com/bedezign/op-core@v0.5.0"
 ```
 
 In `pyproject.toml`, the equivalent is:
@@ -43,7 +43,7 @@ In `pyproject.toml`, the equivalent is:
 ```toml
 [project]
 dependencies = [
-    "op-core @ git+https://github.com/bedezign/op-core@v0.4.0",
+    "op-core @ git+https://github.com/bedezign/op-core@v0.5.0",
 ]
 ```
 
@@ -54,7 +54,7 @@ Or, with `uv`'s `[tool.uv.sources]` syntax:
 dependencies = ["op-core"]
 
 [tool.uv.sources]
-op-core = { git = "https://github.com/bedezign/op-core", tag = "v0.4.0" }
+op-core = { git = "https://github.com/bedezign/op-core", tag = "v0.5.0" }
 ```
 
 Python 3.11+. The CLI backend requires the `op` binary on `PATH`. The SDK extra installs `onepassword-sdk` from PyPI.
@@ -83,8 +83,10 @@ from op_core import (
     CLIBackend, AsyncCLIBackend,                                # CLI backend
     SDKBackend, AsyncSDKBackend,                                # SDK backend
     InMemoryBackend, AsyncInMemoryBackend,                      # in-process backend
-    CachingBackend, AsyncCachingBackend,                        # decorator
-    FileCachingBackend, AsyncFileCachingBackend, default_cache_dir,  # persistent file cache
+    ResolverStack, AsyncResolverStack,                          # resolver stack (satisfies Backend)
+    MemoryLayer,                                                # in-process read-write layer
+    FileReaderLayer, FileWriterLayer,                           # on-disk read-only / read-write layers
+    clear_cache_file, default_cache_dir,                        # cache file helpers
     Backend, AsyncBackend,                                      # protocols (for custom backends)
     detect_backend, detect_async_backend,                       # auto-detection
     Auth, ServiceAccountAuth, DesktopAuth, detect_auth,         # auth types
@@ -127,12 +129,12 @@ op = OnePassword(backend=CLIBackend(
 ### With caching
 
 ```python
-from op_core import CachingBackend, CLIBackend, OnePassword
+from op_core import CLIBackend, MemoryLayer, OnePassword, ResolverStack
 
-op = OnePassword(backend=CachingBackend(CLIBackend(), ttl=300))
+op = OnePassword(backend=ResolverStack([MemoryLayer(ttl=300)], CLIBackend()))
 ```
 
-`CachingBackend` caches `read` and `get_item` results with a TTL and LRU cap. Negative caching is on by default — a missing reference is remembered for the same TTL window so you don't hammer `op` on known misses.
+A `ResolverStack` holds an ordered list of cache layers over one source backend. The read walk is first-live-hit-wins: when a layer returns a live entry (positive value or a stored miss), all writable layers above it are warmed with that result (read-through back-fill), so fast layers fill up from slower ones automatically. Negative caching is included — a confirmed `OpNotFoundError` from the source is stored as a miss record and serves `None` for the TTL window, so repeated misses on the same reference don't re-hit `op`. Only `read()` goes through the layers; `get_item`, `list_items`, and `list_vaults` route straight to the source.
 
 ## Core operations
 
@@ -264,7 +266,7 @@ except OpOfflineError:
 | Backend | Behavior when `online=False` |
 |---|---|
 | `CLIBackend` / `SDKBackend` | Always raises `OpOfflineError` immediately — no subprocess, no SDK call. |
-| `CachingBackend` | Returns a live cached entry if present. On miss or expired entry, raises `OpOfflineError`. Never delegates to the inner backend. |
+| `ResolverStack` | Returns a live cached entry from the first layer that hits. On a full cache miss, raises `OpOfflineError` — the source is never consulted. |
 | `InMemoryBackend` | Returns the value if known locally. On miss, delegates to `fallback` with `online=False` propagated. On terminal miss, raises `OpOfflineError`. |
 
 `OpOfflineError` is distinct from `OpNotFoundError`. The facade's `OnePassword.read` catches `OpNotFoundError` → `None` but deliberately lets `OpOfflineError` propagate so the safety rail actually fires.
@@ -315,7 +317,7 @@ All five inherit from `OpError`, so a broad `except OpError` catches everything 
 
 ## Gotchas
 
-- **`CachingBackend` does not forward `online=`** to its inner backend. Stacked `CachingBackend(CachingBackend(...))` is unsupported.
+- **Additive staleness across a stack.** Because each warmed layer stamps a fresh timestamp with its own TTL, a value served from the top of a stack can be older than any single layer's TTL — worst case approximately the sum of the TTLs along the path it was warmed through. Example: a value lands in a file layer (TTL 3600) at T0; a read at T0+3599 hits the file layer and warms the memory layer (TTL 300), which then serves until T0+3899. Keep upper-layer TTLs small relative to lower ones (the upper layer is a latency cache, not a lifetime extension), and treat the sum as the staleness budget.
 - **Category casing is upper-case canonical** (`"LOGIN"`, `"SECURE_NOTE"`). `SDKBackend` normalizes this at the SDK→canonical boundary so both backends produce interchangeable `Item` values.
 - **`Item.fields` is a flat tuple.** Fields inside sections carry their `section_id` as a back-reference rather than nesting under a section object.
 - **`SDKBackend` only supports service-account auth.** Desktop auth is CLI-only.
@@ -324,6 +326,12 @@ All five inherit from `OpError`, so a broad `except OpError` catches everything 
 - **`Item.urls` is exposed for inspection, not resolution.** The 1Password CLI rejects `op read op://vault/item/<url-label>` with a "not a field" error, so `InMemoryBackend` does not address URL labels via `read()`. Inspect `Item.urls` directly (or use `Item.url(label)` / `Item.primary_url()`) to distinguish a URL-label token from a missing field on the same item.
 - **Every parsed `ItemURL` has a non-empty label.** When the source payload omits or empties the label, op-core fills in `"website"` — the same default 1Password's UI shows. This means a Login item's unlabeled URLs are findable as `item.url("website")` regardless of how the user did or did not name them, but it also means `item.url("website")` may match URLs that weren't *the* "website" — use `item.primary_url()` when you specifically want the primary URL.
 - **`ItemURL.primary` is not populated by the SDK backend.** The SDK's `Website` type has no equivalent flag, so SDK-sourced URLs always carry `primary=False` and `Item.primary_url()` returns `None`. Use `CLIBackend` when the primary marker matters.
+
+## Staleness and cache hygiene
+
+> A cached secret is the value that was live at the moment it was written, served unchanged for the full TTL window. Rotating or editing the item in 1Password does not invalidate any cache entry: there is no invalidation signal, and reads never re-check upstream while an entry is live. If a credential is rotated mid-window, every consumer of the cache keeps receiving the retired value until the entry expires, the cache is cleared (`op-cache clear`), or re-resolved (`op-cache refresh`). This applies to any writer layer, memory or file. Choose TTLs with your rotation procedures in mind, and make `op-cache clear` part of any manual rotation runbook.
+
+For cache inspection and management, see the `op-cache` section in the README (the `clear`, `info`, and `refresh` subcommands). For migrating from the 0.5.0 decorator API (`FileCachingBackend`, `CachingBackend`, `op-env --no-cache`), see the migration recipes in the README.
 
 ## Where to look next
 
