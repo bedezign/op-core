@@ -34,7 +34,9 @@ _NOT_FOUND = _NotFound()
 class CacheEntry:
     key: str  # cache key
     value: Any  # resolved value, or the _NOT_FOUND sentinel for negative cache
-    cached_at: float  # time.monotonic() at insertion
+    cached_at: float  # insertion timestamp; clock is layer-owned, not fixed here --
+    # MemoryLayer stamps time.monotonic(), FileWriterLayer/file_caching stamps wall-clock
+    # time.time() via _wallclock() (needed so ages survive a process restart)
     metadata: dict[str, Any] = field(default_factory=dict)  # arbitrary per-entry bag
 
 

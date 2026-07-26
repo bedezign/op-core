@@ -89,5 +89,5 @@ class AsyncStubBackend:
 def read_sets(path: Path) -> dict[str, dict]:
     """Decode the scrambled cache file and return its raw ``sets`` mapping."""
     payload = file_caching._decode_payload(path.read_bytes())
-    assert payload["version"] == 1
+    assert payload["version"] == file_caching._CACHE_VERSION
     return payload["sets"]

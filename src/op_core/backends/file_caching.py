@@ -65,7 +65,7 @@ import tempfile
 import time
 import zlib
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from op_core.backends.caching import _NOT_FOUND, CacheEntry, _Store
 
@@ -85,13 +85,105 @@ _MACHINE_ID_PATHS = ("/etc/machine-id", "/var/lib/dbus/machine-id")
 _MSG_WRITE_FAILED = "could not write cache file %s: %s"
 _MSG_UNTRUSTED_FILE = "ignoring cache file with unexpected ownership/permissions: %s"
 
-# A set as serialized: {"ttl": float, "entries": {key: {"value"|"miss", "cached_at"}}}
+# Grace period (as a fraction of ttl) applied when a writer does not name its own.
+_DEFAULT_GRACE_FACTOR = 0.5
+
+# Three-way state an entry can be in relative to its set's (ttl, grace).
+_STATE_LIVE: Literal["live"] = "live"
+_STATE_TOMBSTONE: Literal["tombstone"] = "tombstone"
+_STATE_DEAD: Literal["dead"] = "dead"
+_EntryState = Literal["live", "tombstone", "dead"]
+
+# A set as serialized:
+# {"ttl": float, "grace": float,
+#  "entries": {key: {"value"|"miss"|"tombstone", "cached_at"}}}
 _Sets = dict[str, dict[str, Any]]
+
+
+def _entry_state(age: float, ttl: float, grace: float) -> _EntryState:
+    """Classify an entry's age against its set's ``(ttl, grace)``.
+
+    ``live`` while ``0 <= age <= ttl``; ``tombstone`` while
+    ``ttl < age <= ttl + grace``; ``dead`` otherwise. A future-dated entry
+    (negative age, i.e. clock skew) falls straight to ``dead`` -- skew gets no
+    grace period, it just isn't caught by either positive-range check above.
+    """
+    if 0 <= age <= ttl:
+        return _STATE_LIVE
+    if ttl < age <= ttl + grace:
+        return _STATE_TOMBSTONE
+    return _STATE_DEAD
 
 
 def _wallclock() -> float:
     """Indirection over :func:`time.time` so tests can pin the clock."""
     return time.time()
+
+
+def _purge_entries(
+    entries: dict[str, dict[str, Any]], ttl: float, grace: float, now: float
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    """Classify one set's entries live/tombstone/dead against its own ``(ttl, grace)``.
+
+    Returns ``(survivors, dirty)``. Dead entries are dropped outright. Entries newly
+    aged into the tombstone window are rewritten as ``{"tombstone": True, "cached_at":
+    ...}`` -- built from scratch, never ``{**entry, "tombstone": True}``, since that
+    would carry the secret ``value`` forward onto disk. This is the entire no-leak
+    guarantee for tombstoning.
+    """
+    survivors: dict[str, dict[str, Any]] = {}
+    dirty = False
+    for key, entry in entries.items():
+        state = _entry_state(now - entry["cached_at"], ttl, grace)
+        if state == _STATE_DEAD:
+            dirty = True
+            continue
+        if state == _STATE_TOMBSTONE and not entry.get("tombstone"):
+            survivors[key] = {"tombstone": True, "cached_at": entry["cached_at"]}
+            dirty = True
+        else:
+            survivors[key] = entry
+    return survivors, dirty
+
+
+def _validate_set_record(record: dict[str, Any]) -> None:
+    """Validate one set's ``ttl``/``grace``/``entries`` in place. Raises on malformed data.
+
+    Split out of ``_FileCache._validated_sets`` so this validation's own ``if``/``for``
+    nesting is measured from a fresh top level rather than one level deep inside that
+    method's own ``for record in sets.values()`` loop -- flattening, not just relocating.
+    """
+    ttl = record["ttl"]
+    if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or ttl <= 0:
+        raise ValueError("set ttl must be a positive number")
+    # A set written before the grace/tombstone change carries the same version
+    # number (never bumped) but has no "grace" key -- the KeyError below is
+    # caught by every caller of _read_sets/_load_reader_state/_inspect_sets
+    # (all catch KeyError alongside OSError/ValueError/TypeError), so such a
+    # file degrades to "discard and rebuild" rather than crashing.
+    grace = record["grace"]
+    # Unlike ttl, grace=0 is legitimate (no grace period at all) -- just non-negative.
+    if not isinstance(grace, (int, float)) or isinstance(grace, bool) or grace < 0:
+        raise ValueError("set grace must be a non-negative number")
+    entries = record["entries"]
+    if not isinstance(entries, dict):
+        raise TypeError("set entries must be an object")
+    for entry in entries.values():
+        _validate_entry(entry)
+
+
+def _validate_entry(entry: dict[str, Any]) -> None:
+    """Normalize and validate one entry in place. Raises on malformed data.
+
+    Split out of ``_validate_set_record`` for the same reason that function was split
+    out of ``_validated_sets``: its own ``if``/``continue`` nesting is measured from a
+    fresh top level rather than two levels deep inside a nested ``for`` loop.
+    """
+    entry["cached_at"] = float(entry["cached_at"])
+    if entry.get("tombstone"):
+        return  # no "value"/"miss" key to validate -- that's the point.
+    if not entry.get("miss") and not isinstance(entry["value"], str):
+        raise TypeError("cached value must be a string")
 
 
 def _default_cache_path() -> Path:
@@ -212,10 +304,14 @@ class _FileCache:
         max_entries: int,
         path: str | Path | None,
         bucket: str = _DEFAULT_BUCKET,
+        grace: float | None = None,
     ) -> None:
         if not isinstance(ttl, (int, float)) or isinstance(ttl, bool):
             raise TypeError("ttl must be a number of seconds; for read-only access use FileReaderLayer")
+        if grace is not None and (not isinstance(grace, (int, float)) or isinstance(grace, bool) or grace < 0):
+            raise TypeError("grace must be a non-negative number of seconds, or None for the ttl-derived default")
         self._ttl = ttl
+        self._grace = grace if grace is not None else ttl * _DEFAULT_GRACE_FACTOR
         self._bucket = bucket
         self._max_entries = max_entries
         self._store = _Store(max_entries)
@@ -324,13 +420,19 @@ class _FileCache:
             with self._locked():
                 sets, dirty = self._read_sets()
                 own = sets.get(self._bucket)
-                if own is not None and own["ttl"] != self._ttl:
-                    # Different TTL: the set is reconstructed, never reinterpreted.
+                if own is not None and (own["ttl"], own["grace"]) != (self._ttl, self._grace):
+                    # Different (ttl, grace): the set is reconstructed, never reinterpreted.
                     del sets[self._bucket]
                     own = None
                     dirty = True
                 if own is not None:
                     for key, record in own["entries"].items():
+                        # Tombstones carry no "value"/"miss" key at all -- skip them here so
+                        # lookup() never serves one. Not the same as a miss: a miss is a real
+                        # negative record a caller can act on; a tombstone is neither. A later
+                        # "simplification" that drops this skip would crash on record["value"].
+                        if record.get("tombstone"):
+                            continue
                         value: Any = _NOT_FOUND if record.get("miss") else record["value"]
                         self._store.put(
                             key, CacheEntry(key=key, value=value, cached_at=record["cached_at"], metadata={})
@@ -346,7 +448,11 @@ class _FileCache:
         try:
             with self._locked():
                 sets, _ = self._read_sets()
-                sets[self._bucket] = {"ttl": self._ttl, "entries": self._merged_own_entries(sets)}
+                sets[self._bucket] = {
+                    "ttl": self._ttl,
+                    "grace": self._grace,
+                    "entries": self._merged_own_entries(sets),
+                }
                 self._write_sets(sets)
         except OSError as exc:
             log.warning(_MSG_WRITE_FAILED, self._path, exc)
@@ -356,12 +462,12 @@ class _FileCache:
 
         The disk copy may hold fresh entries written by a concurrent process
         after our load; clobbering them would only cost a re-auth, but merging
-        is cheap. A disk set stamped with a different TTL is discarded — the
-        set is being reconstructed under our TTL.
+        is cheap. A disk set stamped with a different ``(ttl, grace)`` is
+        discarded — the set is being reconstructed under our identity.
         """
         disk_own = sets.get(self._bucket)
         merged: dict[str, dict[str, Any]] = {}
-        if disk_own is not None and disk_own["ttl"] == self._ttl:
+        if disk_own is not None and (disk_own["ttl"], disk_own["grace"]) == (self._ttl, self._grace):
             merged.update(disk_own["entries"])
         for key, entry in self._store.items():
             record = self._dump_entry(entry)
@@ -410,38 +516,35 @@ class _FileCache:
     @staticmethod
     def _validated_sets(data: dict[str, Any]) -> _Sets:
         if data.get("version") != _CACHE_VERSION:
+            # No compatibility reader for other versions -- a foreign-versioned payload
+            # is discarded outright.
             raise ValueError("unsupported cache format")
         sets = data["sets"]
         if not isinstance(sets, dict):
             raise TypeError("sets must be an object")
         for record in sets.values():
-            ttl = record["ttl"]
-            if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or ttl <= 0:
-                raise ValueError("set ttl must be a positive number")
-            entries = record["entries"]
-            if not isinstance(entries, dict):
-                raise TypeError("set entries must be an object")
-            for entry in entries.values():
-                entry["cached_at"] = float(entry["cached_at"])
-                if not entry.get("miss") and not isinstance(entry["value"], str):
-                    raise TypeError("cached value must be a string")
+            _validate_set_record(record)
         return sets
 
     @staticmethod
     def _purge(sets: _Sets) -> bool:
-        """Drop entries expired by their own set's TTL; drop emptied sets."""
+        """Purge every set's entries against its own stored ``(ttl, grace)``.
+
+        A set survives as long as it has *any* entries left, tombstoned or not
+        -- that's the point of the grace period: a set with zero live entries
+        but nonzero tombstones is kept, not dropped, so its references remain
+        re-resolvable without reconstructing the whole environment.
+        """
         now = _wallclock()
         dirty = False
-        dead: list[str] = []
+        dead_sets: list[str] = []
         for bucket, record in sets.items():
-            entries = record["entries"]
-            live = {k: e for k, e in entries.items() if 0 <= (now - e["cached_at"]) <= record["ttl"]}
-            if len(live) != len(entries):
-                record["entries"] = live
-                dirty = True
-            if not live:
-                dead.append(bucket)
-        for bucket in dead:
+            survivors, changed = _purge_entries(record["entries"], record["ttl"], record["grace"], now)
+            record["entries"] = survivors
+            dirty = dirty or changed
+            if not survivors:
+                dead_sets.append(bucket)
+        for bucket in dead_sets:
             del sets[bucket]
             dirty = True
         return dirty
@@ -580,6 +683,14 @@ class FileWriterLayer:
     persistence: the layer behaves as an in-memory-only store that writes no
     file and survives only for the lifetime of this object.
 
+    ``grace`` is the tombstone window: once an entry ages past ``ttl`` it is
+    kept as a secret-free tombstone (reference key + timestamp only) for up to
+    ``grace`` more seconds before being dropped outright, so a lapsed set can
+    still be re-resolved without reconstructing the whole environment.
+    Defaults to ``ttl * 0.5`` when not given; ``grace=0`` disables the window
+    entirely. It is writer-owned like ``ttl`` — a set found on disk with a
+    different ``(ttl, grace)`` is discarded and rebuilt, never reinterpreted.
+
     Construction performs purge-on-load: any writer invocation scrubs everyone's
     stale entries from the shared file (existing ``_FileCache`` behavior,
     unchanged).
@@ -591,10 +702,11 @@ class FileWriterLayer:
         bucket: str = _DEFAULT_BUCKET,
         path: str | Path | None = None,
         max_entries: int = 1024,
+        grace: float | None = None,
     ) -> None:
         if max_entries <= 0:
             raise ValueError("max_entries must be positive")
-        self._cache = _FileCache(ttl=ttl, max_entries=max_entries, path=path, bucket=bucket)
+        self._cache = _FileCache(ttl=ttl, max_entries=max_entries, path=path, bucket=bucket, grace=grace)
 
     def lookup(self, reference: str) -> CacheEntry | None:
         """Return a live entry for ``reference``, or ``None``."""

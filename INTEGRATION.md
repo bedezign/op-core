@@ -6,7 +6,7 @@ For a high-level overview, see [`README.md`](README.md). For release notes, see 
 
 ## Status
 
-`v0.6.0` — pre-1.0. The API is stable enough to build against, but minor breaking changes are possible before `v1.0`. Specifically:
+`v0.7.0` — pre-1.0. The API is stable enough to build against, but minor breaking changes are possible before `v1.0`. Specifically:
 
 - Item CRUD (`create_item` / `edit_item` / `delete_item`) is not built. See the README's "What it deliberately does not ship" section. (The `op-env` subprocess runner and persistent file caching shipped in 0.4.0; the resolver stack — `ResolverStack`, `MemoryLayer`, `FileReaderLayer`, `FileWriterLayer` — and the `op-cache` CLI shipped in 0.6.0, replacing the removed decorator classes.)
 - No template / variable-substitution engine, ever. Field values are full `op://` / `ops://` references or literals, with optional `||` fallback chains. If you need richer interpolation (shell variables, embedded templates, etc.), do it in your own code before calling `op.read()` / `op.resolve()`.
@@ -34,8 +34,8 @@ pip install "op-core[sdk] @ git+https://github.com/bedezign/op-core"
 Pin to a tag for reproducibility:
 
 ```bash
-uv add "op-core @ git+https://github.com/bedezign/op-core@v0.6.0"
-pip install "op-core @ git+https://github.com/bedezign/op-core@v0.6.0"
+uv add "op-core @ git+https://github.com/bedezign/op-core@v0.7.0"
+pip install "op-core @ git+https://github.com/bedezign/op-core@v0.7.0"
 ```
 
 In `pyproject.toml`, the equivalent is:
@@ -43,7 +43,7 @@ In `pyproject.toml`, the equivalent is:
 ```toml
 [project]
 dependencies = [
-    "op-core @ git+https://github.com/bedezign/op-core@v0.6.0",
+    "op-core @ git+https://github.com/bedezign/op-core@v0.7.0",
 ]
 ```
 
@@ -54,7 +54,7 @@ Or, with `uv`'s `[tool.uv.sources]` syntax:
 dependencies = ["op-core"]
 
 [tool.uv.sources]
-op-core = { git = "https://github.com/bedezign/op-core", tag = "v0.6.0" }
+op-core = { git = "https://github.com/bedezign/op-core", tag = "v0.7.0" }
 ```
 
 Python 3.11+. The CLI backend requires the `op` binary on `PATH`. The SDK extra installs `onepassword-sdk` from PyPI.
@@ -331,7 +331,7 @@ All five inherit from `OpError`, so a broad `except OpError` catches everything 
 
 > A cached secret is the value that was live at the moment it was written, served unchanged for the full TTL window. Rotating or editing the item in 1Password does not invalidate any cache entry: there is no invalidation signal, and reads never re-check upstream while an entry is live. If a credential is rotated mid-window, every consumer of the cache keeps receiving the retired value until the entry expires, the cache is cleared (`op-cache clear`), or re-resolved (`op-cache refresh`). This applies to any writer layer, memory or file. Choose TTLs with your rotation procedures in mind, and make `op-cache clear` part of any manual rotation runbook.
 
-For cache inspection and management, see the `op-cache` section in the README (the `clear`, `info`, and `refresh` subcommands). For migrating from the 0.5.0 decorator API (`FileCachingBackend`, `CachingBackend`, `op-env --no-cache`), see the migration recipes in the README.
+For cache inspection and management, see the `op-cache` section in the README (the `clear`, `info` (including `--json`), `refresh`, and `warm` subcommands). For migrating from the 0.5.0 decorator API (`FileCachingBackend`, `CachingBackend`, `op-env --no-cache`), see the migration recipes in the README.
 
 ## Security of the on-disk cache
 

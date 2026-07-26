@@ -5,6 +5,18 @@ All notable changes to op-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-07-26
+
+### Added
+
+- **Recoverable expiry (tombstones + grace period).** An expired entry no longer disappears outright: it is rewritten as a tombstone (`{"tombstone": true, "cached_at": ...}`) that retains the reference key and its timestamp but never the secret value, for a writer-owned grace period (defaults to half the TTL). `op-cache refresh --bucket ID` can now resurrect a set within its grace window, not just extend a still-live one; a set aged past `ttl + grace` is purged for good, same as before.
+- **`op-cache warm --bucket ID --ttl N [--grace S]`** — a new verb that mints a fresh, caller-owned TTL (and grace) for a named set (TTL capped at 3 hours), unlike `refresh`, which only restamps under the set's existing stored TTL and grace. Interactive and auth-gated; rebuilds the set outright under the new `(ttl, grace)` rather than restamping it. Like `refresh`, it can only reach live and tombstoned-but-in-grace entries -- neither verb can recover a reference already purged past `ttl + grace`.
+- **`op-cache info --json`** — machine-readable metadata output alongside the existing human-readable format, for scripting against cache state without parsing prose. Reports the same per-bucket counts (values, misses, recoverable) plus ages and time to next expiry.
+
+### Changed
+
+- **On-disk set shape gained a `grace` field, and entries gained a tombstone kind.** Every set now stores its grace period alongside its TTL, and an entry can be `{"tombstone": true, "cached_at": ...}` in addition to the existing value/miss shapes. The cache format version was not bumped for this -- no cache files are worth protecting (they're short-lived, RAM-backed, regenerated on demand), so a file written before this change is simply discarded on first read rather than migrated: same as any other corrupt or foreign file, it degrades to "ignore and rebuild," costing at most one interactive re-authentication for the affected bucket.
+
 ## [0.6.0] — 2026-06-11
 
 ### Added

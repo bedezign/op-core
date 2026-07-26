@@ -19,7 +19,7 @@ from op_core.backends import stack
 from op_core.backends.caching import _NOT_FOUND
 from op_core.backends.stack import AsyncResolverStack, MemoryLayer
 from op_core.exceptions import OpAuthError, OpNotFoundError, OpOfflineError
-from tests.unit.test_resolver_stack import FakeLayer, FakeReadOnlyLayer, _UNSET
+from tests.unit.test_resolver_stack import _UNSET, FakeLayer, FakeReadOnlyLayer
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -59,9 +59,7 @@ class AsyncRecordingSource:
     ) -> str:
         self.read_count += 1
         self.last_read_kwargs = {
-            k: v
-            for k, v in {"default_value": default_value, "online": online}.items()
-            if v is not _UNSET
+            k: v for k, v in {"default_value": default_value, "online": online}.items() if v is not _UNSET
         }
         if self.on_read is not None:
             result = self.on_read()

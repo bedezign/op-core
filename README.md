@@ -48,7 +48,7 @@ pip install "op-core[cli] @ git+https://github.com/bedezign/op-core"
 Pin to a tag for reproducibility:
 
 ```bash
-uv add "op-core @ git+https://github.com/bedezign/op-core@v0.6.0"
+uv add "op-core @ git+https://github.com/bedezign/op-core@v0.7.0"
 ```
 
 Python 3.11+. Zero required dependencies for the base install. The CLI backend requires the `op` binary on `PATH`; the `sdk` extra installs `onepassword-sdk` from PyPI; the `cli` extra installs `python-dotenv` and the `op-env` command.
@@ -277,14 +277,20 @@ Works with both `CLIBackend` (desktop/biometric) and `SDKBackend` (`OP_SERVICE_A
 The base install (no extra required) includes the `op-cache` command for inspecting and managing the persistent cache file.
 
 ```bash
-op-cache clear              # delete the whole cache file (every set, every bucket)
-op-cache info               # file metadata and per-set statistics
-op-cache refresh --bucket ID  # re-resolve one named set's live entries
+op-cache clear                        # delete the whole cache file (every set, every bucket)
+op-cache info                         # file metadata and per-set statistics
+op-cache info --json                  # same statistics, machine-readable
+op-cache refresh --bucket ID          # re-resolve one named set's live entries
+op-cache warm --bucket ID --ttl N     # mint a fresh, caller-owned TTL for a set (capped at 3 hours)
 ```
 
-**`info` is redaction-safe.** It prints file path, size, modification time, and per-set statistics (bucket id, value and miss counts, stored TTL, entry ages, time to next expiry). It never prints secret values or `op://` reference strings — those are exactly what the on-disk scrambling protects. Bucket ids are safe to print; for `op-env` they are opaque hashes.
+**`info` is redaction-safe.** It prints file path, size, modification time, and per-set statistics (bucket id, value and miss counts, stored TTL, entry ages, time to next expiry). It never prints secret values or `op://` reference strings — those are exactly what the on-disk scrambling protects. Bucket ids are safe to print; for `op-env` they are opaque hashes. `--json` emits the same statistics as a machine-readable object, for scripting against cache state without parsing prose.
 
-**`refresh` is interactive and auth-gated.** It authenticates to 1Password to re-resolve the named set's live entries, which with desktop auth triggers an approval prompt — possibly biometric. It is an interactive command by design; do not bury it in non-interactive automation that cannot satisfy the prompt. `--bucket` is required: use `op-cache info` to list bucket ids. Limitation: refresh extends a live set before expiry; it cannot resurrect an expired set (expired entries are purged from the file).
+**Expiry is recoverable within a grace period.** An expired entry does not disappear outright: it is rewritten as a tombstone (retaining the reference key and timestamp, never the secret value) for a writer-owned grace period, which defaults to half the TTL. `refresh` can resurrect a set within its grace window, not just extend a still-live one. A set aged past `ttl + grace` is purged for good.
+
+**`refresh` is interactive and auth-gated.** It authenticates to 1Password to re-resolve the named set's live entries, which with desktop auth triggers an approval prompt — possibly biometric. It is an interactive command by design; do not bury it in non-interactive automation that cannot satisfy the prompt. `--bucket` is required: use `op-cache info` to list bucket ids. `refresh` restamps under the set's existing stored TTL; it can resurrect a set within its grace window but not one already purged.
+
+**`warm` mints a fresh TTL outright.** Unlike `refresh`, `warm --bucket ID --ttl N [--grace S]` rebuilds the set with a caller-chosen TTL and grace (capped at 3 hours for the TTL), discarding and rebuilding the stored set rather than restamping it. Like `refresh`, it can only reach live and tombstoned-but-in-grace entries -- a reference already purged past `ttl + grace` is gone for either verb. Also interactive and auth-gated.
 
 ## Migrating from 0.5.0
 
@@ -348,7 +354,7 @@ The mirror-image caller — one who relied on the silent cache-by-default — ad
 - Service-account auth first-class via `ServiceAccountAuth.from_env()` (`OP_SERVICE_ACCOUNT_TOKEN`).
 - Type hints throughout (`py.typed` ships); strict pyright/mypy clean.
 - Sync and async parity — every public class has an async twin.
-- Explicit, composable caching via `ResolverStack` + `MemoryLayer` / `FileReaderLayer` / `FileWriterLayer`; cache management via `op-cache` (base install); `op-env` (`[cli]` extra) for running a child process or exporting an environment with `op://` references resolved.
+- Explicit, composable caching via `ResolverStack` + `MemoryLayer` / `FileReaderLayer` / `FileWriterLayer`; cache management via `op-cache` (base install), including recoverable expiry (tombstones + a writer-owned grace period), a `warm` verb for minting a fresh caller-owned TTL, and `--json` machine-readable output on `info`; `op-env` (`[cli]` extra) for running a child process or exporting an environment with `op://` references resolved.
 
 ## What it deliberately does not ship
 
@@ -359,7 +365,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the full landed surface.
 
 ## Status
 
-`v0.6.0` — pre-1.0. The public API is stable enough to build against; minor breaking changes are possible before `v1.0`. Track [`CHANGELOG.md`](CHANGELOG.md) for what changes between releases.
+`v0.7.0` — pre-1.0. The public API is stable enough to build against; minor breaking changes are possible before `v1.0`. Track [`CHANGELOG.md`](CHANGELOG.md) for what changes between releases.
 
 ## Documentation
 

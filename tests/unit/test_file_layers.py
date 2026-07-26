@@ -10,8 +10,11 @@ Phase 4 of the resolver-stack redesign (design section 4 / plan Phase 4):
 from __future__ import annotations
 
 import fcntl
+import json
+import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -191,6 +194,27 @@ class TestFileWriterLayerBasic:
         """FileWriterLayer() without ttl must raise TypeError."""
         with pytest.raises(TypeError):
             FileWriterLayer()  # type: ignore[call-arg]
+
+    def test_negative_grace_raises_typeerror(self) -> None:
+        """A negative grace must fail fast, not silently disable the tombstone window."""
+        with pytest.raises(TypeError):
+            FileWriterLayer(ttl=100, grace=-1)
+
+    def test_non_numeric_grace_raises_typeerror(self) -> None:
+        """A non-numeric grace must fail fast, matching the ttl guard."""
+        with pytest.raises(TypeError):
+            FileWriterLayer(ttl=100, grace="50")  # type: ignore[arg-type]
+
+    def test_bool_grace_raises_typeerror(self) -> None:
+        """bool is a subclass of int in Python; it must still be rejected, matching the ttl guard."""
+        with pytest.raises(TypeError):
+            FileWriterLayer(ttl=100, grace=True)  # type: ignore[arg-type]
+
+    def test_zero_grace_is_accepted(self, tmp_path: Path) -> None:
+        """grace=0 is legal -- it disables the tombstone window, it is not an error."""
+        layer = FileWriterLayer(ttl=100, grace=0, path=_cache_path(tmp_path))
+        layer.store(REF, "value")
+        assert layer.lookup(REF) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -483,3 +507,214 @@ class TestClearCacheFile:
 
         sets = read_sets(path)
         assert sets["default"]["entries"][REF]["value"] == "post-clear-value"
+
+
+# ---------------------------------------------------------------------------
+# Tombstone grace period
+# ---------------------------------------------------------------------------
+
+
+class TestTombstoneGracePeriod:
+    def test_entry_aged_into_grace_window_becomes_tombstone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An entry aged past ttl but within grace is converted to a tombstone, not dropped."""
+        path = _cache_path(tmp_path)
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer.store(REF, "secret-value")
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 120)
+        FileWriterLayer(ttl=100, grace=50, path=path)  # construction triggers purge-on-load
+
+        entries = read_sets(path)["default"]["entries"]
+        assert entries[REF] == {"tombstone": True, "cached_at": 1000.0}
+
+    def test_tombstone_survives_further_purge_within_grace_then_dies_after(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A tombstone persists across repeated purges while still within grace, dies once past it."""
+        path = _cache_path(tmp_path)
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer.store(REF, "secret-value")
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 130)
+        FileWriterLayer(ttl=100, grace=50, path=path)
+        assert REF in read_sets(path)["default"]["entries"]
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 151)
+        FileWriterLayer(ttl=100, grace=50, path=path)
+        assert "default" not in read_sets(path)
+
+    def test_set_with_only_tombstones_is_kept_on_disk(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A set with zero live entries but nonzero tombstones is kept, not dropped."""
+        path = _cache_path(tmp_path)
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer.store(REF, "secret-value")
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 120)
+        FileWriterLayer(ttl=100, grace=50, path=path)
+
+        sets = read_sets(path)
+        assert "default" in sets
+        assert sets["default"]["entries"]
+        assert all(entry.get("tombstone") for entry in sets["default"]["entries"].values())
+
+    def test_miss_entry_also_tombstones(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A negative-cache (miss) record tombstones the same as a value record."""
+        path = _cache_path(tmp_path)
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer.store("op://v/missing", _NOT_FOUND)
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 120)
+        FileWriterLayer(ttl=100, grace=50, path=path)
+
+        entry = read_sets(path)["default"]["entries"]["op://v/missing"]
+        assert entry == {"tombstone": True, "cached_at": 1000.0}
+
+    def test_tombstoned_entry_invisible_to_writer_lookup(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A tombstoned entry is served as neither a value nor a miss by the writer."""
+        path = _cache_path(tmp_path)
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer.store(REF, "secret-value")
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 120)
+        fresh = FileWriterLayer(ttl=100, grace=50, path=path)
+        assert fresh.lookup(REF) is None
+
+    def test_reader_serves_neither_value_nor_miss_for_tombstoned_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FileReaderLayer's existing 0 <= age <= ttl filter already excludes tombstones."""
+        path = _cache_path(tmp_path)
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer.store(REF, "value")
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 120)
+        FileWriterLayer(ttl=100, grace=50, path=path)  # tombstones it
+        path.with_name(path.name + ".lock").unlink(missing_ok=True)
+
+        reader = FileReaderLayer(path=path)
+        assert reader.lookup(REF) is None
+
+    def test_writer_constructs_over_tombstoned_file_without_raising(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Constructing a writer over a file whose sets already hold tombstones does not raise."""
+        path = _cache_path(tmp_path)
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer.store(REF, "secret-value")
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 120)
+        FileWriterLayer(ttl=100, grace=50, path=path)  # tombstones it; must not raise
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 130)
+        FileWriterLayer(ttl=100, grace=50, path=path)  # re-open over an already-tombstoned set
+
+    def test_grace_mismatch_rebuilds_set(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two writers on the same ttl but different grace rebuild the set (grace joins the identity check)."""
+        path = _cache_path(tmp_path)
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer1 = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer1.store(REF, "value-a")
+
+        writer2 = FileWriterLayer(ttl=100, grace=25, path=path)
+        assert writer2.lookup(REF) is None
+
+    def test_grace_match_reuses_set(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two writers with matching (ttl, grace) reuse the same set."""
+        path = _cache_path(tmp_path)
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer1 = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer1.store(REF, "value-a")
+
+        writer2 = FileWriterLayer(ttl=100, grace=50, path=path)
+        entry = writer2.lookup(REF)
+        assert entry is not None
+        assert entry.value == "value-a"
+
+    def test_stale_set_missing_grace_key_degrades_instead_of_crashing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A file written before the grace/tombstone change carries no "grace" key on its sets.
+
+        ``_CACHE_VERSION`` stayed at 1 (see the module docstring's grace-period
+        section), so such a file is no longer distinguishable by its version number
+        alone -- it degrades via the same "discard and rebuild" path as any other
+        corrupt file, rather than crashing the caller.
+        """
+        path = _cache_path(tmp_path)
+        stale = {
+            "version": 1,
+            "sets": {"b": {"ttl": 300.0, "entries": {"op://v/i/f": {"value": "x", "cached_at": time.time()}}}},
+        }
+        path.write_bytes(file_caching._encode_payload(stale))
+        path.chmod(0o600)
+
+        with caplog.at_level(logging.WARNING, logger="op_core.backends.file_caching"):
+            writer = FileWriterLayer(ttl=300, bucket="b", path=path)
+        assert writer.lookup("op://v/i/f") is None
+        assert any("corrupt" in r.message.lower() for r in caplog.records)
+
+        # A writer can still proceed and rewrite the file in the current shape.
+        writer.store("op://v/new", "newval")
+        entry = writer.lookup("op://v/new")
+        assert entry is not None
+        assert entry.value == "newval"
+        rewritten = read_sets(path)["b"]
+        assert "grace" in rewritten
+        assert "op://v/i/f" not in rewritten["entries"]
+
+    def test_stale_entry_shape_missing_tombstone_key_degrades_instead_of_crashing(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Old-shaped entries (value/miss only, no tombstone kind) are not themselves a crash risk.
+
+        The set-level "grace" key is what's missing from a pre-change file; entries
+        in the old value/miss shape parse fine on their own (``entry.get("tombstone")``
+        is falsy, so the value/miss branch is taken as before). This test pins that
+        down explicitly so a future change to the entry validation can't silently
+        reintroduce a crash on old-shaped entries without a failing test.
+        """
+        path = _cache_path(tmp_path)
+        stale = {
+            "version": 1,
+            "sets": {
+                "b": {
+                    "ttl": 300.0,
+                    "grace": 0.0,
+                    "entries": {"op://v/i/f": {"miss": True, "cached_at": time.time()}},
+                }
+            },
+        }
+        path.write_bytes(file_caching._encode_payload(stale))
+        path.chmod(0o600)
+
+        with caplog.at_level(logging.WARNING, logger="op_core.backends.file_caching"):
+            writer = FileWriterLayer(ttl=300, bucket="b", grace=0.0, path=path)
+        entry = writer.lookup("op://v/i/f")
+        assert entry is not None
+        assert entry.value is _NOT_FOUND  # the miss record parsed fine, unaffected by the grace revert
+        assert not any("corrupt" in r.message.lower() for r in caplog.records)
+
+    def test_no_leak_secret_absent_from_reencoded_payload(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A value tombstoned via purge leaves no trace of the secret in the re-encoded payload bytes."""
+        path = _cache_path(tmp_path)
+        secret = "hunter2-tombstone-secret"
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0)
+        writer = FileWriterLayer(ttl=100, grace=50, path=path)
+        writer.store(REF, secret)
+
+        monkeypatch.setattr(file_caching, "_wallclock", lambda: 1000.0 + 120)
+        FileWriterLayer(ttl=100, grace=50, path=path)  # triggers the tombstoning purge + rewrite
+
+        decoded = file_caching._decode_payload(path.read_bytes())
+        assert secret not in json.dumps(decoded)

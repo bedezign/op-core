@@ -620,3 +620,33 @@ class TestCrossInstancePersistence:
         entry = FileWriterLayer(ttl=300, path=path).lookup(REF)
         assert entry is not None
         assert entry.value == "persisted-value"
+
+
+# ---------------------------------------------------------------------------
+# _entry_state: pure three-way live/tombstone/dead predicate
+# ---------------------------------------------------------------------------
+
+
+class TestEntryStatePredicate:
+    def test_zero_age_is_live(self) -> None:
+        assert file_caching._entry_state(0, 100, 50) == file_caching._STATE_LIVE
+
+    def test_age_exactly_ttl_is_live(self) -> None:
+        assert file_caching._entry_state(100, 100, 50) == file_caching._STATE_LIVE
+
+    def test_age_just_past_ttl_is_tombstone(self) -> None:
+        assert file_caching._entry_state(100.001, 100, 50) == file_caching._STATE_TOMBSTONE
+
+    def test_age_exactly_ttl_plus_grace_is_tombstone(self) -> None:
+        assert file_caching._entry_state(150, 100, 50) == file_caching._STATE_TOMBSTONE
+
+    def test_age_just_past_ttl_plus_grace_is_dead(self) -> None:
+        assert file_caching._entry_state(150.001, 100, 50) == file_caching._STATE_DEAD
+
+    def test_grace_zero_means_no_grace(self) -> None:
+        """With grace=0, anything past ttl is dead immediately -- no tombstone window at all."""
+        assert file_caching._entry_state(100.001, 100, 0) == file_caching._STATE_DEAD
+
+    def test_future_dated_entry_gets_no_grace(self) -> None:
+        """Clock skew (negative age) falls straight to dead -- skew earns no tombstone."""
+        assert file_caching._entry_state(-5, 100, 50) == file_caching._STATE_DEAD
