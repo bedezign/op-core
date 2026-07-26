@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,9 +24,11 @@ import pytest
 
 from op_core.auth import DesktopAuth, ServiceAccountAuth
 from op_core.backends.sdk import (
+    _SDK_CATEGORY_MAP,
     AsyncSDKBackend,
     SDKBackend,
     _map_sdk_error,
+    _normalize_category,
     _sdk_item_to_canonical,
     _sdk_overview_to_summary,
 )
@@ -153,6 +156,10 @@ def _auth() -> ServiceAccountAuth:
     return ServiceAccountAuth(token="ops_fake_token")
 
 
+def _sdk_available() -> bool:
+    return importlib.util.find_spec("onepassword") is not None
+
+
 # ---------- _map_sdk_error ----------
 
 
@@ -179,6 +186,64 @@ class TestMapSdkError:
         assert "ValueError" in str(exc)
 
 
+# ---------- _normalize_category ----------
+
+# Independent restatement of the naming convention production's
+# _SDK_CATEGORY_MAP is supposed to follow: split the raw PascalCase SDK
+# value on capital-letter boundaries and upper-case with underscores
+# ("SshKey" -> "SSH_KEY", "SocialSecurityNumber" -> "SOCIAL_SECURITY_NUMBER").
+# This is a separate regex from production's own fallback regex in sdk.py --
+# it exists only in this test file so the two can never drift together.
+_WORD_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def _underscored_upper(raw: str) -> str:
+    return _WORD_BOUNDARY.sub("_", raw).upper()
+
+
+class TestNormalizeCategory:
+    """Covers every member of the real SDK's `ItemCategory` enum."""
+
+    @pytest.mark.parametrize("raw", sorted(_SDK_CATEGORY_MAP))
+    def test_known_member_matches_naming_convention(self, raw: str) -> None:
+        """Independence: this does not compare against a second copy of the
+        mapping table (that would only prove the table agrees with itself --
+        a typo pasted into both copies would still pass). Instead it derives
+        the expected value from the underscore-insertion rule the table is
+        supposed to follow and checks production's actual output against
+        that rule, so a wrong entry in _SDK_CATEGORY_MAP fails here even
+        though no independent list of values is maintained. Do not "simplify"
+        this back into comparing two literal tables."""
+        assert _normalize_category(raw) == _underscored_upper(raw)
+
+    @pytest.mark.skipif(not _sdk_available(), reason="op-core[sdk] not installed")
+    def test_covers_every_real_sdk_member(self) -> None:
+        """Introspects the installed SDK's enum so a future member the SDK
+        adds — and that this table was never updated for — fails here
+        instead of silently falling through to the regex fallback."""
+        from onepassword.types import ItemCategory
+
+        actual_members = {member.value for member in ItemCategory}
+        assert actual_members == set(_SDK_CATEGORY_MAP), (
+            "onepassword.types.ItemCategory has members not covered by "
+            "_SDK_CATEGORY_MAP (or vice versa) -- update the mapping table"
+        )
+        for member in ItemCategory:
+            assert _normalize_category(member) == _underscored_upper(member.value)
+
+    def test_unmapped_value_falls_back_to_underscored_upper_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING"):
+            result = _normalize_category("SomeBrandNewCategory")
+        assert result == "SOME_BRAND_NEW_CATEGORY"
+        assert "SomeBrandNewCategory" in caplog.text
+
+    def test_empty_value_returns_empty_string(self) -> None:
+        assert _normalize_category("") == ""
+
+    def test_none_value_returns_empty_string(self) -> None:
+        assert _normalize_category(None) == ""
+
+
 # ---------- mapping helpers ----------
 
 
@@ -200,6 +265,13 @@ class TestMappingHelpers:
             category="LOGIN",
             tags=("prod", "critical"),
         )
+
+    def test_overview_to_summary_multi_word_category(self):
+        """Regression: a multi-word SDK category (e.g. "SshKey") must map to
+        the underscored canonical form ("SSH_KEY"), not a squashed "SSHKEY"."""
+        ov = FakeOverview(id="i1", title="My Key", vault_id="v1", category="SshKey")
+        s = _sdk_overview_to_summary(ov)
+        assert s.category == "SSH_KEY"
 
     def test_item_to_canonical_empty_sections_fields(self):
         fi = FakeItem(id="i1", title="T", vault_id="v1", category="Login")
@@ -414,6 +486,20 @@ class TestAsyncSDKBackendListItems:
         out = await backend.list_items(vault="v1", categories=["LOGIN"])
         assert [s.id for s in out] == ["i1"]
 
+    async def test_list_items_category_filter_multi_word_category_not_silently_dropped(self):
+        """Regression for the silent-filter bug: passing the documented
+        canonical multi-word category ("SSH_KEY") must actually match SDK
+        items of that category, not silently return zero results because
+        the SDK's "SshKey" was normalized to "SSHKEY" instead."""
+        fc = FakeClient()
+        fc.items.overviews_by_vault["v1"] = [
+            FakeOverview(id="i1", title="A Login", vault_id="v1", category="Login"),
+            FakeOverview(id="i2", title="My SSH Key", vault_id="v1", category="SshKey"),
+        ]
+        backend = AsyncSDKBackend(_auth(), client=fc)
+        out = await backend.list_items(vault="v1", categories=["SSH_KEY"])
+        assert [s.id for s in out] == ["i2"]
+
 
 class TestAsyncSDKBackendListVaults:
     async def test_empty_account(self):
@@ -605,10 +691,6 @@ class TestSDKBackendSync:
 # ---------- Tier B: real SDK installed ----------
 
 
-def _sdk_available() -> bool:
-    return importlib.util.find_spec("onepassword") is not None
-
-
 @pytest.mark.skipif(not _sdk_available(), reason="op-core[sdk] not installed")
 class TestRealSDKShape:
     def test_expected_attributes_exist(self):
@@ -642,27 +724,33 @@ class TestRealSDKShape:
         field_ = SdkField(
             id="f1",
             title="username",
-            section_id=None,
-            field_type=ItemFieldType.TEXT,
+            sectionId=None,
+            fieldType=ItemFieldType.TEXT,
             value="alice",
             details=None,
         )
         section = SdkSection(id="s1", title="Section A")
-        item = SdkItem(
-            id="i1",
-            title="Login",
-            category=ItemCategory.LOGIN,
-            vault_id="v1",
-            fields=[field_],
-            sections=[section],
-            notes="",
-            tags=["prod"],
-            websites=[],
-            version=1,
-            files=[],
-            document=None,
-            created_at="2024-01-01T00:00:00Z",
-            updated_at="2024-01-01T00:00:00Z",
+        # Item.created_at/updated_at declare `datetime` post-validation, but the SDK's
+        # own BeforeValidator (parse_rfc3339) only accepts the raw RFC3339 string the
+        # wire format actually sends. model_validate() mirrors that real input shape
+        # instead of fighting pyright's synthesized (post-validation) constructor type.
+        item = SdkItem.model_validate(
+            {
+                "id": "i1",
+                "title": "Login",
+                "category": ItemCategory.LOGIN,
+                "vaultId": "v1",
+                "fields": [field_],
+                "sections": [section],
+                "notes": "",
+                "tags": ["prod"],
+                "websites": [],
+                "version": 1,
+                "files": [],
+                "document": None,
+                "createdAt": "2024-01-01T00:00:00Z",
+                "updatedAt": "2024-01-01T00:00:00Z",
+            }
         )
         canonical = _sdk_item_to_canonical(item)
         assert canonical.id == "i1"

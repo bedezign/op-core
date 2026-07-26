@@ -5,6 +5,12 @@ All notable changes to op-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] — 2026-07-26
+
+### Fixed
+
+- **`SDKBackend`/`AsyncSDKBackend` mis-normalized every multi-word item category.** `_normalize_category` upper-cased the official SDK's PascalCase category values without inserting underscores, so `SshKey` became `SSHKEY` instead of the canonical `SSH_KEY`, `SecureNote` became `SECURENOTE` instead of `SECURE_NOTE`, and so on for all eleven multi-word categories (`API_CREDENTIALS`, `BANK_ACCOUNT`, `CREDIT_CARD`, `CRYPTO_WALLET`, `DRIVER_LICENSE`, `MEDICAL_RECORD`, `OUTDOOR_LICENSE`, `SECURE_NOTE`, `SOCIAL_SECURITY_NUMBER`, `SOFTWARE_LICENSE`, `SSH_KEY`). Single-word categories were unaffected. Beyond wrong `category` values on `Item`/`ItemSummary`, this made `list_items(categories=[...])` silently return zero results whenever a caller passed one of these categories in its documented canonical form -- no exception, no warning, indistinguishable from "none exist." Category normalization now goes through an explicit SDK-value-to-canonical mapping table instead of a bare `.upper()`; an SDK category absent from the table falls back to splitting on capital-letter boundaries and logs a warning rather than failing or guessing silently.
+
 ## [0.7.0] — 2026-07-26
 
 ### Added

@@ -21,8 +21,10 @@ implemented client-side here because the SDK's surface is leaner:
 * Item summaries and full items carry ``vault_name=""`` because the
   SDK's per-item responses omit the vault title. Callers that need
   vault titles should resolve them separately via the vault list.
-* Item ``category`` is upper-cased to match :class:`CLIBackend` —
-  the SDK returns ``"Login"`` where the CLI returns ``"LOGIN"``.
+* Item ``category`` is mapped via an explicit table to match
+  :class:`CLIBackend`'s canonical upper-snake-case form — the SDK returns
+  ``"SshKey"`` where the CLI returns ``"SSH_KEY"`` (see
+  ``_SDK_CATEGORY_MAP``).
 
 Error mapping is heuristic: the SDK surfaces most failures as plain
 ``Exception`` instances carrying the underlying error message as
@@ -36,6 +38,8 @@ import asyncio
 import atexit
 import contextlib
 import importlib
+import logging
+import re
 import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -54,8 +58,48 @@ from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, It
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
 
+log = logging.getLogger(__name__)
+
 _INTEGRATION_NAME = "op-core"
-_INTEGRATION_VERSION = "0.7.0"
+_INTEGRATION_VERSION = "0.7.1"
+
+# Maps the official SDK's PascalCase `ItemCategory` value (`member.value`,
+# e.g. "SshKey") to op-core's canonical upper-snake-case form (e.g.
+# "SSH_KEY") -- the same form CLIBackend gets for free from `op`'s own JSON
+# output. A bare `.upper()` is only correct for the single-word members;
+# every multi-word member needs an inserted underscore, so this is an
+# explicit table rather than a regex guess. Keep in sync with
+# ``onepassword.types.ItemCategory`` -- ``TestNormalizeCategory
+# .test_covers_every_real_sdk_member`` fails if the installed SDK adds a
+# member this table doesn't know about.
+_SDK_CATEGORY_MAP: dict[str, str] = {
+    "Login": "LOGIN",
+    "SecureNote": "SECURE_NOTE",
+    "CreditCard": "CREDIT_CARD",
+    "CryptoWallet": "CRYPTO_WALLET",
+    "Identity": "IDENTITY",
+    "Password": "PASSWORD",
+    "Document": "DOCUMENT",
+    "ApiCredentials": "API_CREDENTIALS",
+    "BankAccount": "BANK_ACCOUNT",
+    "Database": "DATABASE",
+    "DriverLicense": "DRIVER_LICENSE",
+    "Email": "EMAIL",
+    "MedicalRecord": "MEDICAL_RECORD",
+    "Membership": "MEMBERSHIP",
+    "OutdoorLicense": "OUTDOOR_LICENSE",
+    "Passport": "PASSPORT",
+    "Rewards": "REWARDS",
+    "Router": "ROUTER",
+    "Server": "SERVER",
+    "SshKey": "SSH_KEY",
+    "SocialSecurityNumber": "SOCIAL_SECURITY_NUMBER",
+    "SoftwareLicense": "SOFTWARE_LICENSE",
+    "Person": "PERSON",
+    "Unsupported": "UNSUPPORTED",
+}
+
+_CATEGORY_WORD_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 
 _AUTH_PHRASES = (
     "unauthorized",
@@ -121,8 +165,29 @@ def _stringify_enum(value: Any) -> str:
 
 
 def _normalize_category(value: Any) -> str:
-    """Return the SDK category as upper-case to match CLIBackend."""
-    return _stringify_enum(value).upper()
+    """Return the SDK category in op-core's canonical upper-snake-case form.
+
+    Looks the raw SDK value (e.g. ``"SshKey"``) up in :data:`_SDK_CATEGORY_MAP`.
+    A member the SDK added after this table was last updated falls back to
+    splitting on capital-letter boundaries and upper-casing -- logged as a
+    warning rather than raised, since an unrecognized category must not break
+    reads, and rather than silently guessed, since a silent wrong answer is
+    the exact failure mode this fallback exists to avoid.
+    """
+    raw = _stringify_enum(value)
+    if not raw:
+        return ""
+    mapped = _SDK_CATEGORY_MAP.get(raw)
+    if mapped is not None:
+        return mapped
+    fallback = _CATEGORY_WORD_BOUNDARY.sub("_", raw).upper()
+    log.warning(
+        "op_core.backends.sdk: unmapped SDK category %r; falling back to %r. "
+        "Update _SDK_CATEGORY_MAP in op_core.backends.sdk.",
+        raw,
+        fallback,
+    )
+    return fallback
 
 
 def _sdk_overview_to_summary(overview: Any) -> ItemSummary:
