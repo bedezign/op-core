@@ -30,9 +30,19 @@ auto-built item index on collision.
 A section or field label containing ``/`` cannot be used as a path
 component — the key using that form is skipped, and the field remains
 addressable through its other forms (in practice the bare ``id`` and/or the
-section-id-qualified forms). If two distinct fields on the same item would
-resolve to the same key, building the index raises :class:`ValueError`
-naming the item and both field ids.
+section-id-qualified forms).
+
+Every key built from a field's *label* (bare or section-qualified) and every
+key built from a field's *id* share one namespace. Two distinct fields
+claiming the same key of the *same* kind — both label-derived, or both
+id-derived — is genuine ambiguity, and building the index raises
+:class:`ValueError` naming the item and both field ids. A label-derived key
+and an id-derived key from *different* fields landing on the same string is
+not an error: the label-derived key wins, and the id-keyed field stays
+reachable through its other forms (in practice its bare id). This matters in
+practice because a 1Password item's built-in field ids are fixed and can
+collide with a user-added field's label — e.g. a SERVER item's built-in URL
+field (label ``URL``, id ``url``) alongside a user field labelled ``url``.
 
 Values that start with ``op://`` or ``ops://`` (op-core references,
 including ``||`` chains that start with a reference segment) are NOT
@@ -90,31 +100,40 @@ def _vaults_from_items(items: Iterable[Item]) -> list[VaultSummary]:
     return list(seen.values())
 
 
-def _field_index_keys(base: str, field: ItemField, sections_by_id: Mapping[str, ItemSection]) -> set[str]:
-    """Return every ``op://`` key ``field`` should be indexed under.
+def _field_index_keys(
+    base: str, field: ItemField, sections_by_id: Mapping[str, ItemSection]
+) -> tuple[set[str], set[str]]:
+    """Return the ``(id_keys, label_keys)`` op:// keys ``field`` should be indexed under.
 
-    See :func:`_build_item_index` for the addressing scheme this implements.
-    A path component (a label or an id) containing ``/`` is excluded from
-    the key forms it would otherwise appear in.
+    See :func:`_build_item_index` for the addressing scheme and the
+    label-wins collision rule this split enables. A key's kind is decided by
+    which field form it uses, regardless of whether the section component
+    (when present) is the section's label or its id: the bare id and every
+    section-qualified key using ``field.id`` are id-derived; every key using
+    ``field.label`` is label-derived. When a field's label equals its id, it
+    contributes no separate label-derived keys — its keys are id-derived
+    only. A path component (a label or an id) containing ``/`` is excluded
+    from the key forms it would otherwise appear in.
     """
-    keys: set[str] = set()
+    id_keys: set[str] = set()
+    label_keys: set[str] = set()
+    has_own_label = field.label != field.id
     if "/" not in field.id:
-        keys.add(f"{base}/{field.id}")
+        id_keys.add(f"{base}/{field.id}")
     if field.section_id is None:
-        if field.label != field.id and "/" not in field.label:
-            keys.add(f"{base}/{field.label}")
-        return keys
+        if has_own_label and "/" not in field.label:
+            label_keys.add(f"{base}/{field.label}")
+        return id_keys, label_keys
     section = sections_by_id.get(field.section_id)
     section_forms = {section.label, section.id} if section is not None else {field.section_id}
-    field_forms = {field.label, field.id}
     for section_form in section_forms:
         if "/" in section_form:
             continue
-        for field_form in field_forms:
-            if "/" in field_form:
-                continue
-            keys.add(f"{base}/{section_form}/{field_form}")
-    return keys
+        if "/" not in field.id:
+            id_keys.add(f"{base}/{section_form}/{field.id}")
+        if has_own_label and "/" not in field.label:
+            label_keys.add(f"{base}/{section_form}/{field.label}")
+    return id_keys, label_keys
 
 
 def _build_item_index(items: Iterable[Item]) -> dict[str, str]:
@@ -139,28 +158,47 @@ def _build_item_index(items: Iterable[Item]) -> dict[str, str]:
     instead of the value it points at. Other ``://`` values (e.g.
     ``https://example.com``) are indexed as literals.
 
-    Raises :class:`ValueError` if two distinct fields on the same item
-    resolve to the same key.
+    A key built from one field's label and a key built from a *different*
+    field's id share one namespace. Where the two coincide, the label-derived
+    key wins and the id-keyed field remains reachable through its other
+    forms (see :func:`_field_index_keys`). Raises :class:`ValueError` only
+    for a *same-kind* collision — two distinct fields whose label-derived
+    keys coincide, or two distinct fields whose id-derived keys coincide.
     """
     index: dict[str, str] = {}
     for item in items:
         base = f"op://{item.vault_id}/{item.id}"
         sections_by_id = {section.id: section for section in item.sections}
-        owner_by_key: dict[str, str] = {}
+        id_owner_by_key: dict[str, str] = {}
+        label_owner_by_key: dict[str, str] = {}
+        id_values: dict[str, str] = {}
+        label_values: dict[str, str] = {}
         for field in item.fields:
             if field.value is None:
                 continue
             if field.value.startswith(_REFERENCE_PREFIXES):
                 continue
-            for key in _field_index_keys(base, field, sections_by_id):
-                owner = owner_by_key.get(key)
+            id_keys, label_keys = _field_index_keys(base, field, sections_by_id)
+            for key in id_keys:
+                owner = id_owner_by_key.get(key)
                 if owner is not None and owner != field.id:
                     raise ValueError(
                         f"duplicate item-index key {key!r} on item {item.vault_id}/{item.id}: "
                         f"fields {owner!r} and {field.id!r} both resolve to it"
                     )
-                owner_by_key[key] = field.id
-                index[key] = field.value
+                id_owner_by_key[key] = field.id
+                id_values[key] = field.value
+            for key in label_keys:
+                owner = label_owner_by_key.get(key)
+                if owner is not None and owner != field.id:
+                    raise ValueError(
+                        f"duplicate item-index key {key!r} on item {item.vault_id}/{item.id}: "
+                        f"fields {owner!r} and {field.id!r} both resolve to it"
+                    )
+                label_owner_by_key[key] = field.id
+                label_values[key] = field.value
+        index.update(id_values)
+        index.update(label_values)
     return index
 
 

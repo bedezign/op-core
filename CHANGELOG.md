@@ -5,6 +5,12 @@ All notable changes to op-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — 2026-08-13
+
+### Fixed
+
+- The item-index collision check raised `ValueError` when one field's id-derived key coincided with another field's label-derived key — a shape 1Password itself produces (the built-in `url` field id on LOGIN/SERVER items plus a user-added field labelled `url`), making such items unindexable through no fault of the data. Only same-kind collisions (two distinct fields claiming the same label-derived key) raise; where a label key and an id key coincide, the label form wins deterministically and the shadowed field remains reachable through its other forms.
+
 ## [0.8.0] — 2026-08-13
 
 ### Changed

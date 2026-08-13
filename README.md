@@ -48,7 +48,7 @@ pip install "op-core[cli] @ git+https://github.com/bedezign/op-core"
 Pin to a tag for reproducibility:
 
 ```bash
-uv add "op-core @ git+https://github.com/bedezign/op-core@v0.8.0"
+uv add "op-core @ git+https://github.com/bedezign/op-core@v0.8.1"
 ```
 
 Python 3.11+. Zero required dependencies for the base install. The CLI backend requires the `op` binary on `PATH`; the `sdk` extra installs `onepassword-sdk` from PyPI; the `cli` extra installs `python-dotenv` and the `op-env` command.
@@ -365,7 +365,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the full landed surface.
 
 ## Status
 
-`v0.8.0` — pre-1.0. The public API is stable enough to build against; minor breaking changes are possible before `v1.0`. Track [`CHANGELOG.md`](CHANGELOG.md) for what changes between releases.
+`v0.8.1` — pre-1.0. The public API is stable enough to build against; minor breaking changes are possible before `v1.0`. Track [`CHANGELOG.md`](CHANGELOG.md) for what changes between releases.
 
 ## Documentation
 

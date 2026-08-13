@@ -508,19 +508,72 @@ class TestItemAutoIndex:
         assert "f1" in message
         assert "f2" in message
 
-    def test_field_id_equal_to_other_field_label_raises_value_error(self):
+    def test_field_id_equal_to_other_field_label_label_wins(self):
+        # "beta" is field alpha's label-derived key AND field beta's
+        # id-derived key. A label-derived key and an id-derived key from
+        # different fields coinciding is not an error; the label-derived
+        # form wins.
         item = _make_item(
             fields=(
                 ItemField(id="alpha", label="beta", value="first", type="STRING", section_id=None),
                 ItemField(id="beta", label="gamma", value="second", type="STRING", section_id=None),
             )
         )
-        with pytest.raises(ValueError) as exc_info:
-            InMemoryBackend(items=[item])
-        message = str(exc_info.value)
-        assert "op://v1/itm1/beta" in message
-        assert "alpha" in message
-        assert "beta" in message
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/beta") == "first"
+        # field beta remains reachable via its own id and label keys.
+        assert backend.read("op://v1/itm1/gamma") == "second"
+
+    def test_cross_kind_collision_in_section_label_wins(self):
+        item = _make_item(
+            sections=(ItemSection(id="s1", label="S"),),
+            fields=(
+                ItemField(id="dup", label="alpha", value="from-id", type="STRING", section_id="s1"),
+                ItemField(id="other", label="dup", value="from-label", type="STRING", section_id="s1"),
+            ),
+        )
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/S/dup") == "from-label"
+        assert backend.read("op://v1/itm1/s1/dup") == "from-label"
+        # The shadowed field's other forms stay reachable.
+        assert backend.read("op://v1/itm1/S/alpha") == "from-id"
+        assert backend.read("op://v1/itm1/dup") == "from-id"
+
+    def test_builtin_url_id_shadowed_by_user_field_label_wins(self):
+        # Real-world shape: a built-in URL field with fixed id "url" plus a
+        # user-added custom field labelled "url" with a distinct id.
+        item = _make_item(
+            fields=(
+                ItemField(id="url", label="URL", value="https://a.example", type="URL", section_id=None),
+                ItemField(
+                    id="4l3iq5fho44w4pj42mi543xwiq",
+                    label="url",
+                    value="https://b.example",
+                    type="STRING",
+                    section_id=None,
+                ),
+            )
+        )
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/url") == "https://b.example"
+        assert backend.read("op://v1/itm1/URL") == "https://a.example"
+        assert backend.read("op://v1/itm1/4l3iq5fho44w4pj42mi543xwiq") == "https://b.example"
+
+    def test_label_equals_id_field_shadowed_reachable_only_via_get_item(self):
+        # field A's label equals its id, so its sole key is id-derived. field
+        # B's label collides with that key. Label wins uniformly, so A's only
+        # key is shadowed — A stops being addressable via read() but stays
+        # reachable through the item itself.
+        item = _make_item(
+            fields=(
+                ItemField(id="url", label="url", value="from-A", type="STRING", section_id=None),
+                ItemField(id="user-added-id", label="url", value="from-B", type="STRING", section_id=None),
+            )
+        )
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/url") == "from-B"
+        result_item = backend.get_item("itm1")
+        assert any(f.id == "url" and f.value == "from-A" for f in result_item.fields)
 
     def test_reference_valued_field_not_indexed_falls_through_to_fallback(self):
         # A field whose value is itself a reference (e.g. a self-reference like
@@ -658,6 +711,23 @@ class TestAsyncItemAutoIndex:
         backend = AsyncInMemoryBackend(items=[item])
         with pytest.raises(OpNotFoundError):
             await backend.read("op://v1/itm1/hostname")
+
+    async def test_builtin_url_id_shadowed_by_user_field_label_wins(self):
+        item = _make_item(
+            fields=(
+                ItemField(id="url", label="URL", value="https://a.example", type="URL", section_id=None),
+                ItemField(
+                    id="4l3iq5fho44w4pj42mi543xwiq",
+                    label="url",
+                    value="https://b.example",
+                    type="STRING",
+                    section_id=None,
+                ),
+            )
+        )
+        backend = AsyncInMemoryBackend(items=[item])
+        assert await backend.read("op://v1/itm1/url") == "https://b.example"
+        assert await backend.read("op://v1/itm1/URL") == "https://a.example"
 
 
 # ---------- fallback ----------

@@ -45,7 +45,7 @@ from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, It
 from op_core.opref import OpRef
 from op_core.strings import expand_braces
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 __all__ = (  # noqa: RUF022 — semantic grouping intentional
     # Version
