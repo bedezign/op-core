@@ -17,6 +17,7 @@ def _make_item(
     vault_name: str = "Personal",
     category: str = "LOGIN",
     tags: tuple[str, ...] = (),
+    sections: tuple[ItemSection, ...] | None = None,
     fields: tuple[ItemField, ...] | None = None,
 ) -> Item:
     return Item(
@@ -26,7 +27,7 @@ def _make_item(
         vault_name=vault_name,
         category=category,
         tags=tags,
-        sections=(ItemSection(id="s1", label="S"),),
+        sections=sections if sections is not None else (ItemSection(id="s1", label="S"),),
         fields=fields
         if fields is not None
         else (
@@ -330,15 +331,102 @@ class TestItemAutoIndex:
         backend = InMemoryBackend(items=[_make_item()])
         assert backend.read("op://v1/itm1/f1") == "u"
 
-    def test_sectioned_field_readable_by_label(self):
-        # Sections carry section_id as a back-reference; InMemoryBackend indexes
-        # by plain op://vault/item/<label> to stay byte-compatible with `op read`.
+    def test_sectioned_field_bare_label_not_indexed(self):
+        # A bare label unambiguously names a top-level field; a sectioned
+        # field's label is only addressable qualified by its section.
         backend = InMemoryBackend(items=[_make_item()])
-        assert backend.read("op://v1/itm1/password") == "p"
+        with pytest.raises(OpNotFoundError):
+            backend.read("op://v1/itm1/password")
+
+    def test_sectioned_field_bare_label_falls_through_to_fallback(self):
+        fallback = _RecordingBackend(refs={"op://v1/itm1/password": "from-fallback"})
+        backend = InMemoryBackend(items=[_make_item()], fallback=fallback)
+        assert backend.read("op://v1/itm1/password") == "from-fallback"
+        assert fallback.calls == [("op://v1/itm1/password", True)]
 
     def test_sectioned_field_readable_by_id(self):
         backend = InMemoryBackend(items=[_make_item()])
         assert backend.read("op://v1/itm1/f2") == "p"
+
+    def test_sectioned_field_readable_by_all_form_combinations(self):
+        backend = InMemoryBackend(items=[_make_item()])
+        assert backend.read("op://v1/itm1/S/password") == "p"
+        assert backend.read("op://v1/itm1/S/f2") == "p"
+        assert backend.read("op://v1/itm1/s1/password") == "p"
+        assert backend.read("op://v1/itm1/s1/f2") == "p"
+
+    def test_unknown_section_id_addressable_by_raw_id(self):
+        item = _make_item(
+            sections=(ItemSection(id="s1", label="S"),),
+            fields=(ItemField(id="f9", label="ghost-field", value="v", type="STRING", section_id="ghost"),),
+        )
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/ghost/ghost-field") == "v"
+        assert backend.read("op://v1/itm1/ghost/f9") == "v"
+        assert backend.read("op://v1/itm1/f9") == "v"
+
+    def test_section_label_equals_id_no_collision(self):
+        item = _make_item(
+            sections=(ItemSection(id="sec", label="sec"),),
+            fields=(ItemField(id="f1", label="pw", value="p", type="CONCEALED", section_id="sec"),),
+        )
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/sec/pw") == "p"
+
+    def test_section_label_with_slash_not_addressable_by_label(self):
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="Router / admin"),),
+            fields=(ItemField(id="f9", label="user", value="u", type="STRING", section_id="sX"),),
+        )
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/sX/user") == "u"
+        assert backend.read("op://v1/itm1/f9") == "u"
+        with pytest.raises(OpNotFoundError):
+            backend.read("op://v1/itm1/Router / admin/user")
+
+    def test_top_level_field_label_with_slash_has_no_label_key(self):
+        item = _make_item(fields=(ItemField(id="idab", label="a/b", value="v", type="STRING", section_id=None),))
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/idab") == "v"
+        with pytest.raises(OpNotFoundError):
+            backend.read("op://v1/itm1/a/b")
+
+    def test_top_level_and_sectioned_fields_share_label_both_addressable(self):
+        # Motivating scenario: a top-level field and a sectioned field share a
+        # label, plus a third field with that same label whose value is a
+        # self-reference. All three coexist without colliding because the
+        # reference is never indexed and the sectioned field never claims the
+        # bare label.
+        item = _make_item(
+            sections=(ItemSection(id="s1", label="Section"),),
+            fields=(
+                ItemField(id="top", label="username", value="pi", type="STRING", section_id=None),
+                ItemField(id="sec", label="username", value="admin", type="STRING", section_id="s1"),
+                ItemField(id="ref", label="username", value="op://././username", type="STRING", section_id="s1"),
+            ),
+        )
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/username") == "pi"
+        assert backend.read("op://v1/itm1/Section/username") == "admin"
+        with pytest.raises(OpNotFoundError):
+            backend.read("op://v1/itm1/ref")
+
+    def test_empty_items_list_produces_empty_index(self):
+        backend = InMemoryBackend(items=[])
+        with pytest.raises(OpNotFoundError):
+            backend.read("op://v1/itm1/anything")
+
+    def test_item_with_zero_fields_produces_no_keys(self):
+        item = _make_item(fields=())
+        backend = InMemoryBackend(items=[item])
+        with pytest.raises(OpNotFoundError):
+            backend.read("op://v1/itm1/username")
+
+    def test_empty_string_label_indexed_without_crash(self):
+        item = _make_item(fields=(ItemField(id="idx", label="", value="v", type="STRING", section_id=None),))
+        backend = InMemoryBackend(items=[item])
+        assert backend.read("op://v1/itm1/idx") == "v"
+        assert backend.read("op://v1/itm1/") == "v"
 
     def test_none_value_field_skipped(self):
         item = _make_item(fields=(ItemField(id="f1", label="empty", value=None, type="STRING", section_id=None),))
@@ -390,20 +478,49 @@ class TestItemAutoIndex:
         assert backend.read("op://v1/itm1/contraseña") == "hunter2"
         assert backend.read("op://v1/itm1/🔑 token") == "abc"
 
-    def test_duplicate_label_within_item_last_wins(self):
-        # When two literal-valued fields on the same item share a label,
-        # last-in-iteration-order wins in the auto-built index.
+    def test_duplicate_top_level_label_raises_value_error(self):
+        # When two literal-valued fields on the same item would resolve to
+        # the same key, index construction raises rather than picking a
+        # winner silently.
         item = _make_item(
             fields=(
                 ItemField(id="f1", label="username", value="first", type="STRING", section_id=None),
                 ItemField(id="f2", label="username", value="second", type="STRING", section_id=None),
             )
         )
-        backend = InMemoryBackend(items=[item])
-        assert backend.read("op://v1/itm1/username") == "second"
-        # Each id is still distinctly addressable.
-        assert backend.read("op://v1/itm1/f1") == "first"
-        assert backend.read("op://v1/itm1/f2") == "second"
+        with pytest.raises(ValueError) as exc_info:
+            InMemoryBackend(items=[item])
+        message = str(exc_info.value)
+        assert "op://v1/itm1/username" in message
+        assert "f1" in message
+        assert "f2" in message
+
+    def test_duplicate_label_in_same_section_raises_value_error(self):
+        item = _make_item(
+            fields=(
+                ItemField(id="f1", label="dup", value="first", type="STRING", section_id="s1"),
+                ItemField(id="f2", label="dup", value="second", type="STRING", section_id="s1"),
+            )
+        )
+        with pytest.raises(ValueError) as exc_info:
+            InMemoryBackend(items=[item])
+        message = str(exc_info.value)
+        assert "f1" in message
+        assert "f2" in message
+
+    def test_field_id_equal_to_other_field_label_raises_value_error(self):
+        item = _make_item(
+            fields=(
+                ItemField(id="alpha", label="beta", value="first", type="STRING", section_id=None),
+                ItemField(id="beta", label="gamma", value="second", type="STRING", section_id=None),
+            )
+        )
+        with pytest.raises(ValueError) as exc_info:
+            InMemoryBackend(items=[item])
+        message = str(exc_info.value)
+        assert "op://v1/itm1/beta" in message
+        assert "alpha" in message
+        assert "beta" in message
 
     def test_reference_valued_field_not_indexed_falls_through_to_fallback(self):
         # A field whose value is itself a reference (e.g. a self-reference like
@@ -520,6 +637,10 @@ class TestAsyncItemAutoIndex:
     async def test_id_hit(self):
         backend = AsyncInMemoryBackend(items=[_make_item()])
         assert await backend.read("op://v1/itm1/f2") == "p"
+
+    async def test_section_qualified_read(self):
+        backend = AsyncInMemoryBackend(items=[_make_item()])
+        assert await backend.read("op://v1/itm1/S/password") == "p"
 
     async def test_refs_override(self):
         backend = AsyncInMemoryBackend(

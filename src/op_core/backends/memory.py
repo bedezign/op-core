@@ -14,11 +14,25 @@ two distinct purposes:
 
 Passing ``items=`` both powers :meth:`list_items`/:meth:`get_item` and makes
 every non-``None``, non-reference :class:`~op_core.items.ItemField` value
-addressable via :meth:`read` under ``op://<vault_id>/<item_id>/<label>`` **and**
-``op://<vault_id>/<item_id>/<id>``. So
-``InMemoryBackend(items=fetched_items, fallback=CLIBackend())`` serves the
-fetched literal fields from memory and only falls through on genuine misses.
-Explicit ``refs`` win over the auto-built item index on collision.
+addressable via :meth:`read`. A top-level field (no section) is addressable
+under ``op://<vault_id>/<item_id>/<label>`` **and**
+``op://<vault_id>/<item_id>/<id>``. A field that belongs to a section is
+addressable under ``op://<vault_id>/<item_id>/<section>/<label-or-id>``,
+where ``<section>`` is either the section's label or its id and
+``<label-or-id>`` is either the field's label or its id, **plus** the bare
+``op://<vault_id>/<item_id>/<id>`` escape hatch, which always works
+regardless of section membership. A bare label therefore unambiguously
+names a top-level field. So ``InMemoryBackend(items=fetched_items,
+fallback=CLIBackend())`` serves the fetched literal fields from memory and
+only falls through on genuine misses. Explicit ``refs`` win over the
+auto-built item index on collision.
+
+A section or field label containing ``/`` cannot be used as a path
+component — the key using that form is skipped, and the field remains
+addressable through its other forms (in practice the bare ``id`` and/or the
+section-id-qualified forms). If two distinct fields on the same item would
+resolve to the same key, building the index raises :class:`ValueError`
+naming the item and both field ids.
 
 Values that start with ``op://`` or ``ops://`` (op-core references,
 including ``||`` chains that start with a reference segment) are NOT
@@ -39,7 +53,7 @@ from typing import TYPE_CHECKING
 
 from op_core.backends._filters import validate_filter
 from op_core.exceptions import OpNotFoundError, OpOfflineError
-from op_core.items import Item, ItemRef, ItemSummary, VaultSummary
+from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
 
 # Prefix-based check (not substring '://' in value) so legitimate URL field
 # values like "https://example.com" still get indexed as literals.
@@ -76,10 +90,46 @@ def _vaults_from_items(items: Iterable[Item]) -> list[VaultSummary]:
     return list(seen.values())
 
 
-def _build_item_index(items: Iterable[Item]) -> dict[str, str]:
-    """Return a ``{op://vault/item/label: value}`` lookup for non-``None`` literal fields.
+def _field_index_keys(base: str, field: ItemField, sections_by_id: Mapping[str, ItemSection]) -> set[str]:
+    """Return every ``op://`` key ``field`` should be indexed under.
 
-    Indexes each field under both its label and its id (unless they are identical).
+    See :func:`_build_item_index` for the addressing scheme this implements.
+    A path component (a label or an id) containing ``/`` is excluded from
+    the key forms it would otherwise appear in.
+    """
+    keys: set[str] = set()
+    if "/" not in field.id:
+        keys.add(f"{base}/{field.id}")
+    if field.section_id is None:
+        if field.label != field.id and "/" not in field.label:
+            keys.add(f"{base}/{field.label}")
+        return keys
+    section = sections_by_id.get(field.section_id)
+    section_forms = {section.label, section.id} if section is not None else {field.section_id}
+    field_forms = {field.label, field.id}
+    for section_form in section_forms:
+        if "/" in section_form:
+            continue
+        for field_form in field_forms:
+            if "/" in field_form:
+                continue
+            keys.add(f"{base}/{section_form}/{field_form}")
+    return keys
+
+
+def _build_item_index(items: Iterable[Item]) -> dict[str, str]:
+    """Return a ``{op://vault/item/...: value}`` lookup for non-``None`` literal fields.
+
+    A top-level field (``section_id is None``) is indexed under its bare
+    label (when the label differs from the id) and under its bare id. A
+    field that belongs to a section is indexed under every combination of
+    section form (its label, its id) crossed with field form (its label,
+    its id) — e.g. ``op://vault/item/{section_label}/{field_label}`` and
+    ``op://vault/item/{section_id}/{field_id}`` — plus its bare id, which is
+    always indexed regardless of section membership. A ``section_id`` with
+    no matching entry in ``item.sections`` is used verbatim as the sole
+    section form. Sectioned fields are never indexed under a bare label, so
+    a bare label unambiguously resolves to a top-level field.
 
     Fields whose value starts with ``op://`` or ``ops://`` (an op-core
     reference, including a ``||`` chain that starts with a reference segment)
@@ -89,20 +139,28 @@ def _build_item_index(items: Iterable[Item]) -> dict[str, str]:
     instead of the value it points at. Other ``://`` values (e.g.
     ``https://example.com``) are indexed as literals.
 
-    When two literal-valued fields on the same item share a label,
-    last-in-iteration-order wins.
+    Raises :class:`ValueError` if two distinct fields on the same item
+    resolve to the same key.
     """
     index: dict[str, str] = {}
     for item in items:
         base = f"op://{item.vault_id}/{item.id}"
+        sections_by_id = {section.id: section for section in item.sections}
+        owner_by_key: dict[str, str] = {}
         for field in item.fields:
             if field.value is None:
                 continue
             if field.value.startswith(_REFERENCE_PREFIXES):
                 continue
-            index[f"{base}/{field.label}"] = field.value
-            if field.id != field.label:
-                index[f"{base}/{field.id}"] = field.value
+            for key in _field_index_keys(base, field, sections_by_id):
+                owner = owner_by_key.get(key)
+                if owner is not None and owner != field.id:
+                    raise ValueError(
+                        f"duplicate item-index key {key!r} on item {item.vault_id}/{item.id}: "
+                        f"fields {owner!r} and {field.id!r} both resolve to it"
+                    )
+                owner_by_key[key] = field.id
+                index[key] = field.value
     return index
 
 
@@ -254,7 +312,9 @@ class AsyncInMemoryBackend:
             result.append(_to_summary(item))
         return result
 
-    async def get_item(self, item: ItemRef, *, vault: str | None = None) -> Item:  # NOSONAR python:S7503 — async required for AsyncBackend protocol conformance
+    async def get_item(
+        self, item: ItemRef, *, vault: str | None = None
+    ) -> Item:  # NOSONAR python:S7503 — async required for AsyncBackend protocol conformance
         item_id = item if isinstance(item, str) else item.id
         effective_vault = vault
         if effective_vault is None and not isinstance(item, str):
@@ -267,5 +327,7 @@ class AsyncInMemoryBackend:
             return candidate
         raise OpNotFoundError(f"item not found: {item_id}")
 
-    async def list_vaults(self) -> list[VaultSummary]:  # NOSONAR python:S7503 — async required for AsyncBackend protocol conformance
+    async def list_vaults(
+        self,
+    ) -> list[VaultSummary]:  # NOSONAR python:S7503 — async required for AsyncBackend protocol conformance
         return _vaults_from_items(self._items)

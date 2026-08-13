@@ -5,6 +5,14 @@ All notable changes to op-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-08-13
+
+### Changed
+
+- **Breaking:** the `InMemoryBackend`/`AsyncInMemoryBackend` item index is section-aware. A bare `op://vault/item/<label>` addresses top-level fields only; a field inside a section is addressed as `op://vault/item/<section>/<field>`, where section and field may each be given by label or id. The bare `op://vault/item/<field-id>` escape hatch works for every field regardless of section. This matches `op` CLI resolution, which returns the top-level field for a bare label.
+- Building the item index raises `ValueError` when two distinct fields on one item resolve to the same reference key. Previously colliding labels resolved silently to whichever field iterated last.
+- A section or field label containing `/` is not emitted as a path component; such fields remain addressable via their id forms.
+
 ## [0.7.1] — 2026-07-26
 
 ### Fixed

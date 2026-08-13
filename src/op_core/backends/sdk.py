@@ -61,7 +61,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger(__name__)
 
 _INTEGRATION_NAME = "op-core"
-_INTEGRATION_VERSION = "0.7.1"
+_INTEGRATION_VERSION = "0.8.0"
 
 # Maps the official SDK's PascalCase `ItemCategory` value (`member.value`,
 # e.g. "SshKey") to op-core's canonical upper-snake-case form (e.g.
