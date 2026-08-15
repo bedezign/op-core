@@ -5,6 +5,18 @@ All notable changes to op-core will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-08-15
+
+### Added
+
+- `InMemoryBackend` and `AsyncInMemoryBackend` now index section and field labels containing `/` verbatim, so a raw copy-reference like `op://<vault>/<item>/RUT200 / admin/host` — where "RUT200 / admin" is a section label — resolves from the in-memory index. Such path forms used to be skipped from the label index and fell through to the fallback backend only.
+- The memory backend now rewrites a reference it cannot serve from the index (field value is `None` or a reference itself) to canonical id form `op://<vault_id>/<item_id>/<section_id>/<field_id>` before passing it to the fallback backend, when the reference unambiguously names one seeded field. The real `op` CLI never sees a slash-bearing label path it would reject as "too many `/`".
+
+### Changed
+
+- An exact-duplicate key collision that slash-bearing labels can now produce raises `ValueError` at index build time, per the existing same-kind collision rule. Collisions between slash-bearing and non-slash-bearing label paths are a new class of edge case the indexing logic must catch.
+- `OpRef` documentation clarifies that field-path quoting and `%2F`-encoding are not preserved on emit — `for_op()` / `for_storage()` emit the field path raw. This is a documented limitation, not a behaviour change.
+
 ## [0.8.1] — 2026-08-13
 
 ### Fixed

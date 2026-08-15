@@ -87,6 +87,15 @@ class OpRef:
 
         Rejected:
         - op://Vault/./field  (. in item requires . in vault)
+
+        ``field_path`` is the raw, undecorated rejoin of every segment past
+        the item position — any quoting or ``%2F``-encoding used to embed a
+        literal ``/`` inside one of those segments is resolved during
+        splitting and not preserved in the result. A three-segment field
+        path is therefore indistinguishable from a two-segment field whose
+        first segment happened to contain a literal ``/`` — the round trip
+        through :meth:`for_op`/:meth:`for_storage`, which emit
+        ``field_path`` verbatim, does not restore the original segmentation.
         """
         sensitive = uri.startswith(OPS_PREFIX)
 
@@ -174,6 +183,10 @@ class OpRef:
         return self._to_uri(OPS_PREFIX if self.sensitive else OP_PREFIX)
 
     def _to_uri(self, prefix: str) -> str:
+        # field_path is emitted raw, unlike vault/item — see the segmentation
+        # caveat in OpRef.parse's docstring. A field_path built from
+        # multiple segments (e.g. "section/field") is indistinguishable on
+        # the wire from one whose sole segment contains a literal "/".
         vault = _encode_part(self.vault)
         item = _encode_part(self.item)
 

@@ -373,7 +373,7 @@ class TestItemAutoIndex:
         backend = InMemoryBackend(items=[item])
         assert backend.read("op://v1/itm1/sec/pw") == "p"
 
-    def test_section_label_with_slash_not_addressable_by_label(self):
+    def test_section_label_with_slash_addressable_by_label(self):
         item = _make_item(
             sections=(ItemSection(id="sX", label="Router / admin"),),
             fields=(ItemField(id="f9", label="user", value="u", type="STRING", section_id="sX"),),
@@ -381,15 +381,42 @@ class TestItemAutoIndex:
         backend = InMemoryBackend(items=[item])
         assert backend.read("op://v1/itm1/sX/user") == "u"
         assert backend.read("op://v1/itm1/f9") == "u"
-        with pytest.raises(OpNotFoundError):
-            backend.read("op://v1/itm1/Router / admin/user")
+        assert backend.read("op://v1/itm1/Router / admin/user") == "u"
 
-    def test_top_level_field_label_with_slash_has_no_label_key(self):
+    def test_top_level_field_label_with_slash_addressable_by_label(self):
         item = _make_item(fields=(ItemField(id="idab", label="a/b", value="v", type="STRING", section_id=None),))
         backend = InMemoryBackend(items=[item])
         assert backend.read("op://v1/itm1/idab") == "v"
-        with pytest.raises(OpNotFoundError):
-            backend.read("op://v1/itm1/a/b")
+        assert backend.read("op://v1/itm1/a/b") == "v"
+
+    def test_section_label_with_embedded_slash_readable_by_full_raw_ref_no_fallback(self):
+        # Motivating case: a real 1Password item with section label
+        # "RUT200 / admin" copy-referenced verbatim by a downstream consumer.
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="RUT200 / admin"),),
+            fields=(ItemField(id="f9", label="host", value="192.168.1.1", type="STRING", section_id="sX"),),
+        )
+        fallback = _RecordingBackend()
+        backend = InMemoryBackend(items=[item], fallback=fallback)
+        assert backend.read("op://v1/itm1/RUT200 / admin/host") == "192.168.1.1"
+        assert fallback.calls == []
+
+    def test_slash_bearing_label_collision_with_sectioned_field_raises_value_error(self):
+        # A top-level field labelled "S/password" and a field labelled
+        # "password" inside a section labelled "S" both produce the
+        # label-derived key "op://v1/itm1/S/password" — genuine ambiguity.
+        item = _make_item(
+            sections=(ItemSection(id="s1", label="S"),),
+            fields=(
+                ItemField(id="top", label="S/password", value="from-top", type="STRING", section_id=None),
+                ItemField(id="f2", label="password", value="p", type="CONCEALED", section_id="s1"),
+            ),
+        )
+        with pytest.raises(ValueError) as exc_info:
+            InMemoryBackend(items=[item])
+        message = str(exc_info.value)
+        assert "top" in message
+        assert "f2" in message
 
     def test_top_level_and_sectioned_fields_share_label_both_addressable(self):
         # Motivating scenario: a top-level field and a sectioned field share a
@@ -682,6 +709,123 @@ class TestItemAutoIndex:
             backend.read("op://v1/itm1/kinyxfl75abc")
 
 
+# ---------- id substitution before fallback ----------
+
+
+class TestSubstituteIds:
+    def test_rewrites_unindexable_ref_for_none_valued_field(self):
+        # A None-valued field is never indexed, so the raw slash-bearing ref
+        # must be rewritten to id form before the fallback sees it.
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="Router / admin"),),
+            fields=(ItemField(id="f9", label="host", value=None, type="STRING", section_id="sX"),),
+        )
+        fallback = _RecordingBackend(refs={"op://v1/itm1/sX/f9": "resolved"})
+        backend = InMemoryBackend(items=[item], fallback=fallback)
+        assert backend.read("op://v1/itm1/Router / admin/host") == "resolved"
+        assert fallback.calls == [("op://v1/itm1/sX/f9", True)]
+
+    def test_rewrites_unindexable_ref_for_reference_valued_field(self):
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="Router / admin"),),
+            fields=(
+                ItemField(
+                    id="f9", label="host", value="op://Vault/Other/hostname", type="STRING", section_id="sX"
+                ),
+            ),
+        )
+        fallback = _RecordingBackend(refs={"op://v1/itm1/sX/f9": "resolved"})
+        backend = InMemoryBackend(items=[item], fallback=fallback)
+        assert backend.read("op://v1/itm1/Router / admin/host") == "resolved"
+        assert fallback.calls == [("op://v1/itm1/sX/f9", True)]
+
+    def test_leaves_reference_unchanged_when_item_unknown(self):
+        fallback = _RecordingBackend(refs={"op://v1/unknown/A / B/host": "resolved"})
+        backend = InMemoryBackend(items=[_make_item()], fallback=fallback)
+        assert backend.read("op://v1/unknown/A / B/host") == "resolved"
+        assert fallback.calls == [("op://v1/unknown/A / B/host", True)]
+
+    def test_leaves_reference_unchanged_on_ambiguous_match(self):
+        # field_path "Sec/host" matches field f1's label form ("host") AND
+        # field host's id form ("host") — two distinct fields, no rewrite.
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="Sec"),),
+            fields=(
+                ItemField(id="f1", label="host", value=None, type="STRING", section_id="sX"),
+                ItemField(id="host", label="f1", value=None, type="STRING", section_id="sX"),
+            ),
+        )
+        fallback = _RecordingBackend(refs={"op://v1/itm1/Sec/host": "resolved"})
+        backend = InMemoryBackend(items=[item], fallback=fallback)
+        assert backend.read("op://v1/itm1/Sec/host") == "resolved"
+        assert fallback.calls == [("op://v1/itm1/Sec/host", True)]
+
+    def test_skipped_when_field_path_has_no_slash(self):
+        fallback = _RecordingBackend(refs={"op://v1/itm1/plainfield": "resolved"})
+        backend = InMemoryBackend(items=[_make_item()], fallback=fallback)
+        assert backend.read("op://v1/itm1/plainfield") == "resolved"
+        assert fallback.calls == [("op://v1/itm1/plainfield", True)]
+
+    def test_skipped_when_field_path_has_multiple_slashes_and_no_match(self):
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="Sec"),),
+            fields=(ItemField(id="f9", label="host", value=None, type="STRING", section_id="sX"),),
+        )
+        fallback = _RecordingBackend(refs={"op://v1/itm1/a/b/c": "resolved"})
+        backend = InMemoryBackend(items=[item], fallback=fallback)
+        assert backend.read("op://v1/itm1/a/b/c") == "resolved"
+        assert fallback.calls == [("op://v1/itm1/a/b/c", True)]
+
+    def test_skipped_on_malformed_reference(self):
+        fallback = _RecordingBackend(refs={"not-a-uri": "resolved"})
+        backend = InMemoryBackend(items=[_make_item()], fallback=fallback)
+        assert backend.read("not-a-uri") == "resolved"
+        assert fallback.calls == [("not-a-uri", True)]
+
+    def test_preserves_ops_prefix(self):
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="Router / admin"),),
+            fields=(ItemField(id="f9", label="host", value=None, type="STRING", section_id="sX"),),
+        )
+        fallback = _RecordingBackend(refs={"ops://v1/itm1/sX/f9": "resolved"})
+        backend = InMemoryBackend(items=[item], fallback=fallback)
+        assert backend.read("ops://v1/itm1/Router / admin/host") == "resolved"
+        assert fallback.calls == [("ops://v1/itm1/sX/f9", True)]
+
+    def test_matches_item_by_vault_name_and_title(self):
+        item = _make_item(
+            vault_id="v1",
+            vault_name="Personal Vault",
+            item_id="itm1",
+            title="My Router",
+            sections=(ItemSection(id="sX", label="Router / admin"),),
+            fields=(ItemField(id="f9", label="host", value=None, type="STRING", section_id="sX"),),
+        )
+        fallback = _RecordingBackend(refs={"op://v1/itm1/sX/f9": "resolved"})
+        backend = InMemoryBackend(items=[item], fallback=fallback)
+        assert backend.read("op://Personal Vault/My Router/Router / admin/host") == "resolved"
+        assert fallback.calls == [("op://v1/itm1/sX/f9", True)]
+
+    def test_unicode_section_label_with_slash(self):
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="Ñoño / admin"),),
+            fields=(ItemField(id="f9", label="contraseña", value=None, type="STRING", section_id="sX"),),
+        )
+        fallback = _RecordingBackend(refs={"op://v1/itm1/sX/f9": "resolved"})
+        backend = InMemoryBackend(items=[item], fallback=fallback)
+        assert backend.read("op://v1/itm1/Ñoño / admin/contraseña") == "resolved"
+        assert fallback.calls == [("op://v1/itm1/sX/f9", True)]
+
+    def test_no_fallback_set_still_raises_not_found(self):
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="Router / admin"),),
+            fields=(ItemField(id="f9", label="host", value=None, type="STRING", section_id="sX"),),
+        )
+        backend = InMemoryBackend(items=[item])
+        with pytest.raises(OpNotFoundError):
+            backend.read("op://v1/itm1/Router / admin/host")
+
+
 class TestAsyncItemAutoIndex:
     async def test_label_hit(self):
         backend = AsyncInMemoryBackend(items=[_make_item()])
@@ -729,6 +873,26 @@ class TestAsyncItemAutoIndex:
         assert await backend.read("op://v1/itm1/url") == "https://b.example"
         assert await backend.read("op://v1/itm1/URL") == "https://a.example"
 
+    async def test_section_label_with_embedded_slash_readable_by_full_raw_ref(self):
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="RUT200 / admin"),),
+            fields=(ItemField(id="f9", label="host", value="192.168.1.1", type="STRING", section_id="sX"),),
+        )
+        fallback = _AsyncRecordingBackend()
+        backend = AsyncInMemoryBackend(items=[item], fallback=fallback)
+        assert await backend.read("op://v1/itm1/RUT200 / admin/host") == "192.168.1.1"
+        assert fallback.calls == []
+
+    async def test_substitution_rewrites_unindexable_ref(self):
+        item = _make_item(
+            sections=(ItemSection(id="sX", label="Router / admin"),),
+            fields=(ItemField(id="f9", label="host", value=None, type="STRING", section_id="sX"),),
+        )
+        fallback = _AsyncRecordingBackend(refs={"op://v1/itm1/sX/f9": "resolved"})
+        backend = AsyncInMemoryBackend(items=[item], fallback=fallback)
+        assert await backend.read("op://v1/itm1/Router / admin/host") == "resolved"
+        assert fallback.calls == [("op://v1/itm1/sX/f9", True)]
+
 
 # ---------- fallback ----------
 
@@ -757,6 +921,31 @@ class _RecordingBackend:
         return []
 
     def get_item(self, item, *, vault=None):
+        raise OpNotFoundError(item)
+
+
+class _AsyncRecordingBackend:
+    """Minimal AsyncBackend stub that records read() calls."""
+
+    def __init__(self, refs: dict[str, str] | None = None) -> None:
+        self._refs = refs or {}
+        self.calls: list[tuple[str, bool]] = []
+
+    async def read(self, reference: str, *, default_value: str | None = None, online: bool = True) -> str:
+        self.calls.append((reference, online))
+        if reference in self._refs:
+            return self._refs[reference]
+        if default_value is not None:
+            return default_value
+        raise OpNotFoundError(reference)
+
+    async def list_items(self, **kwargs):
+        return []
+
+    async def list_vaults(self):
+        return []
+
+    async def get_item(self, item, *, vault=None):
         raise OpNotFoundError(item)
 
 

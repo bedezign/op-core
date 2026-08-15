@@ -27,10 +27,11 @@ fallback=CLIBackend())`` serves the fetched literal fields from memory and
 only falls through on genuine misses. Explicit ``refs`` win over the
 auto-built item index on collision.
 
-A section or field label containing ``/`` cannot be used as a path
-component — the key using that form is skipped, and the field remains
-addressable through its other forms (in practice the bare ``id`` and/or the
-section-id-qualified forms).
+A section or field label containing ``/`` is indexed under its raw literal
+form like any other label. ``read()`` does exact-string lookup against the
+index, so a ``/`` inside a path component is unambiguous as part of a dict
+key: a section labelled ``RUT200 / admin`` with a field labelled ``host`` is
+addressable as ``op://<vault_id>/<item_id>/RUT200 / admin/host``.
 
 Every key built from a field's *label* (bare or section-qualified) and every
 key built from a field's *id* share one namespace. Two distinct fields
@@ -52,6 +53,16 @@ is set). Indexing them as literals would return the reference string
 instead of the value it points at. Other ``://`` values such as
 ``https://example.com`` are indexed as ordinary literals.
 
+A reference whose field path cannot be served from the index (the field's
+value is ``None``, or is itself a reference) but whose components match
+exactly one seeded field is rewritten to canonical id form —
+``op://<vault_id>/<item_id>/<section_id>/<field_id>`` — before being handed
+to ``fallback``. This matters because the field path may itself contain
+literal ``/`` characters copied verbatim from a slash-bearing section or
+field label, which the real ``op`` CLI rejects as "too many '/'"; canonical
+id form never contains more than the fixed path segments. A reference that
+does not resolve to exactly one field is passed to ``fallback`` unchanged.
+
 The async variant wraps the sync one — there is no I/O to await, so
 duplicating logic would be pure ceremony.
 """
@@ -64,6 +75,7 @@ from typing import TYPE_CHECKING
 from op_core.backends._filters import validate_filter
 from op_core.exceptions import OpNotFoundError, OpOfflineError
 from op_core.items import Item, ItemField, ItemRef, ItemSection, ItemSummary, VaultSummary
+from op_core.opref import OpRef
 
 # Prefix-based check (not substring '://' in value) so legitimate URL field
 # values like "https://example.com" still get indexed as literals.
@@ -112,26 +124,23 @@ def _field_index_keys(
     section-qualified key using ``field.id`` are id-derived; every key using
     ``field.label`` is label-derived. When a field's label equals its id, it
     contributes no separate label-derived keys — its keys are id-derived
-    only. A path component (a label or an id) containing ``/`` is excluded
-    from the key forms it would otherwise appear in.
+    only. A label or id containing ``/`` is included in the key forms
+    verbatim — the key is looked up by exact string match, so an embedded
+    ``/`` is unambiguous.
     """
     id_keys: set[str] = set()
     label_keys: set[str] = set()
     has_own_label = field.label != field.id
-    if "/" not in field.id:
-        id_keys.add(f"{base}/{field.id}")
+    id_keys.add(f"{base}/{field.id}")
     if field.section_id is None:
-        if has_own_label and "/" not in field.label:
+        if has_own_label:
             label_keys.add(f"{base}/{field.label}")
         return id_keys, label_keys
     section = sections_by_id.get(field.section_id)
     section_forms = {section.label, section.id} if section is not None else {field.section_id}
     for section_form in section_forms:
-        if "/" in section_form:
-            continue
-        if "/" not in field.id:
-            id_keys.add(f"{base}/{section_form}/{field.id}")
-        if has_own_label and "/" not in field.label:
+        id_keys.add(f"{base}/{section_form}/{field.id}")
+        if has_own_label:
             label_keys.add(f"{base}/{section_form}/{field.label}")
     return id_keys, label_keys
 
@@ -202,6 +211,70 @@ def _build_item_index(items: Iterable[Item]) -> dict[str, str]:
     return index
 
 
+def _match_field(
+    item: Item, field_path: str, sections_by_id: Mapping[str, ItemSection]
+) -> tuple[str, str | None] | None:
+    """Return the ``(field_id, section_id)`` of the sole field in ``item`` addressed by ``field_path``.
+
+    A top-level field matches when ``field_path`` equals its label or its
+    id. A sectioned field matches when ``field_path`` equals
+    ``f"{section_form}/{field_form}"`` for any combination of section form
+    (its label, its id) and field form (its label, its id). Returns
+    ``None`` when zero or more than one distinct field matches.
+    """
+    matches: set[tuple[str, str | None]] = set()
+    for field in item.fields:
+        if field.section_id is None:
+            if field_path in (field.label, field.id):
+                matches.add((field.id, None))
+            continue
+        section = sections_by_id.get(field.section_id)
+        section_forms = {section.label, section.id} if section is not None else {field.section_id}
+        field_forms = {field.label, field.id}
+        for section_form in section_forms:
+            for field_form in field_forms:
+                if f"{section_form}/{field_form}" == field_path:
+                    matches.add((field.id, field.section_id))
+    if len(matches) != 1:
+        return None
+    return matches.pop()
+
+
+def _substitute_ids(reference: str, items: Sequence[Item]) -> str:
+    """Rewrite ``reference`` to canonical id form when it unambiguously names one seeded field.
+
+    Returns ``reference`` unchanged when: it fails to parse, its field path
+    has no ``/`` (nothing to rewrite), its vault/item component matches zero
+    or more than one seeded item, its field path matches zero or more than
+    one field on the matched item, a rewritten component still contains
+    ``/``, or the rewritten string equals the original.
+    """
+    try:
+        ref = OpRef.parse(reference)
+    except ValueError:
+        return reference
+    if ref.field_path is None or "/" not in ref.field_path:
+        return reference
+    matched_items = [
+        item for item in items if ref.vault in (item.vault_id, item.vault_name) and ref.item in (item.id, item.title)
+    ]
+    if len(matched_items) != 1:
+        return reference
+    item = matched_items[0]
+    sections_by_id = {section.id: section for section in item.sections}
+    match = _match_field(item, ref.field_path, sections_by_id)
+    if match is None:
+        return reference
+    field_id, section_id = match
+    if "/" in item.vault_id or "/" in item.id or "/" in field_id or (section_id is not None and "/" in section_id):
+        return reference
+    rewritten_field_path = f"{section_id}/{field_id}" if section_id is not None else field_id
+    rewritten = OpRef(
+        vault=item.vault_id, item=item.id, field_path=rewritten_field_path, sensitive=ref.sensitive
+    ).for_storage()
+    return rewritten if rewritten != reference else reference
+
+
 class InMemoryBackend:
     """Backend backed by an in-process dict of refs and list of items.
 
@@ -238,7 +311,7 @@ class InMemoryBackend:
             return self._item_index[reference]
         if self._fallback is not None:
             try:
-                return self._fallback.read(reference, online=online)
+                return self._fallback.read(_substitute_ids(reference, self._items), online=online)
             except OpNotFoundError:
                 if default_value is not None:
                     return default_value
@@ -317,7 +390,7 @@ class AsyncInMemoryBackend:
             return self._item_index[reference]
         if self._fallback is not None:
             try:
-                return await self._fallback.read(reference, online=online)
+                return await self._fallback.read(_substitute_ids(reference, self._items), online=online)
             except OpNotFoundError:
                 if default_value is not None:
                     return default_value
